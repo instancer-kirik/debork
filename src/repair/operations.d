@@ -163,6 +163,13 @@ class RepairOperations {
         }
 
         try {
+            // First, ensure mkinitcpio configuration is correct
+            if (sysInfo.packageManager == PackageManager.PACMAN) {
+                ensureMkinitcpioConfig(sysInfo);
+                // Also verify UUID is properly detected
+                verifyAndFixDeviceDetection(sysInfo);
+            }
+
             string[][] commands = getInitramfsCommands(sysInfo.packageManager);
             bool anySuccess = false;
 
@@ -195,6 +202,343 @@ class RepairOperations {
         } catch (Exception e) {
             Logger.error("Exception during initramfs regeneration: " ~ e.msg);
             return false;
+        }
+    }
+
+    /**
+     * Ensure mkinitcpio.conf has proper hooks for filesystem detection
+     */
+    private void ensureMkinitcpioConfig(ref SystemInfo sysInfo) {
+        import std.file : readText, write;
+        import std.string : indexOf, replace;
+
+        string configPath = buildPath(sysInfo.mountPoint, "etc", "mkinitcpio.conf");
+
+        if (!exists(configPath)) {
+            Logger.warning("mkinitcpio.conf not found at: " ~ configPath);
+            return;
+        }
+
+        try {
+            string content = readText(configPath);
+            string originalContent = content;
+            bool modified = false;
+
+            // Find the HOOKS line
+            auto hooksIdx = content.indexOf("HOOKS=(");
+            if (hooksIdx != -1) {
+                auto hooksEnd = content.indexOf(")", hooksIdx);
+                if (hooksEnd != -1) {
+                    string hooksLine = content[hooksIdx .. hooksEnd + 1];
+                    string newHooksLine = hooksLine;
+
+                    // Essential hooks that must be present for device detection
+                    string[] requiredHooks = ["base", "udev", "autodetect", "modconf", "block", "filesystems", "fsck"];
+
+                    // Check if btrfs filesystem needs btrfs hook
+                    if (sysInfo.isBtrfs && hooksLine.indexOf("btrfs") == -1) {
+                        // Add btrfs hook before filesystems
+                        newHooksLine = newHooksLine.replace("filesystems", "btrfs filesystems");
+                        Logger.info("Adding btrfs hook to mkinitcpio.conf");
+                        modified = true;
+                    }
+
+                    // Ensure fsck is at the end if not present
+                    if (hooksLine.indexOf("fsck") == -1) {
+                        newHooksLine = newHooksLine.replace(")", " fsck)");
+                        Logger.info("Adding fsck hook to mkinitcpio.conf");
+                        modified = true;
+                    }
+
+                    // Ensure block hook is present (critical for device detection)
+                    if (hooksLine.indexOf("block") == -1) {
+                        // Add block hook after modconf
+                        if (hooksLine.indexOf("modconf") != -1) {
+                            newHooksLine = newHooksLine.replace("modconf", "modconf block");
+                        } else {
+                            // Add it before filesystems
+                            newHooksLine = newHooksLine.replace("filesystems", "block filesystems");
+                        }
+                        Logger.info("Adding block hook to mkinitcpio.conf");
+                        modified = true;
+                    }
+
+                    // Check for keyboard hook if using encryption
+                    if (hooksLine.indexOf("encrypt") != -1 && hooksLine.indexOf("keyboard") == -1) {
+                        // Add keyboard before encrypt
+                        newHooksLine = newHooksLine.replace("encrypt", "keyboard encrypt");
+                        Logger.info("Adding keyboard hook before encrypt in mkinitcpio.conf");
+                        modified = true;
+                    }
+
+                    if (modified) {
+                        content = content.replace(hooksLine, newHooksLine);
+                        Logger.info("Updated HOOKS line: " ~ newHooksLine);
+                    }
+                }
+            }
+
+            // Check MODULES line for necessary modules
+            auto modulesIdx = content.indexOf("MODULES=(");
+            if (modulesIdx != -1) {
+                auto modulesEnd = content.indexOf(")", modulesIdx);
+                if (modulesEnd != -1) {
+                    string modulesLine = content[modulesIdx .. modulesEnd + 1];
+                    string newModulesLine = modulesLine;
+
+                    // Add btrfs module if using btrfs
+                    if (sysInfo.isBtrfs && modulesLine.indexOf("btrfs") == -1) {
+                        if (modulesLine == "MODULES=()") {
+                            newModulesLine = "MODULES=(btrfs)";
+                        } else {
+                            newModulesLine = newModulesLine.replace(")", " btrfs)");
+                        }
+                        Logger.info("Adding btrfs module to mkinitcpio.conf");
+                        modified = true;
+                    }
+
+                    // Detect and add storage controller modules
+                    string[] storageModules = detectStorageModules();
+                    foreach (mod; storageModules) {
+                        if (modulesLine.indexOf(mod) == -1) {
+                            if (newModulesLine == "MODULES=()") {
+                                newModulesLine = "MODULES=(" ~ mod ~ ")";
+                            } else {
+                                newModulesLine = newModulesLine.replace(")", " " ~ mod ~ ")");
+                            }
+                            Logger.info("Adding storage module to mkinitcpio.conf: " ~ mod);
+                            modified = true;
+                        }
+                    }
+
+                    if (newModulesLine != modulesLine) {
+                        content = content.replace(modulesLine, newModulesLine);
+                        Logger.info("Updated MODULES line: " ~ newModulesLine);
+                    }
+                }
+            }
+
+            // Write back if modified
+            if (modified) {
+                // Backup original
+                string backupPath = configPath ~ ".bak";
+                write(backupPath, originalContent);
+                Logger.info("Backed up original mkinitcpio.conf to: " ~ backupPath);
+
+                // Write new content
+                write(configPath, content);
+                Logger.info("Updated mkinitcpio.conf with proper hooks and modules");
+                ui.printInfo("Fixed mkinitcpio.conf configuration");
+            }
+
+        } catch (Exception e) {
+            Logger.error("Failed to update mkinitcpio.conf: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Verify and fix device detection issues
+     */
+    private void verifyAndFixDeviceDetection(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+
+        // If UUID is empty, try to detect it
+        if (sysInfo.uuid.length == 0) {
+            Logger.warning("UUID not detected, attempting to find it");
+
+            try {
+                // Try blkid first
+                auto result = executeShell("blkid -s UUID -o value " ~ sysInfo.device);
+                if (result.status == 0 && result.output.length > 0) {
+                    sysInfo.uuid = result.output.strip();
+                    Logger.info("Detected UUID: " ~ sysInfo.uuid);
+                    ui.printInfo("Found filesystem UUID: " ~ sysInfo.uuid);
+                } else {
+                    // Try lsblk as fallback
+                    result = executeShell("lsblk -no UUID " ~ sysInfo.device ~ " | head -n1");
+                    if (result.status == 0 && result.output.length > 0) {
+                        sysInfo.uuid = result.output.strip();
+                        Logger.info("Detected UUID via lsblk: " ~ sysInfo.uuid);
+                    }
+                }
+            } catch (Exception e) {
+                Logger.error("Failed to detect UUID: " ~ e.msg);
+            }
+        }
+
+        // Verify the device actually exists
+        if (!exists(sysInfo.device)) {
+            Logger.error("Device does not exist: " ~ sysInfo.device);
+            ui.printError("Warning: Device " ~ sysInfo.device ~ " not found!");
+
+            // Try to find the device by UUID if we have it
+            if (sysInfo.uuid.length > 0) {
+                string byUuidPath = "/dev/disk/by-uuid/" ~ sysInfo.uuid;
+                if (exists(byUuidPath)) {
+                    // Resolve the symlink to get the actual device
+                    try {
+                        auto result = executeShell("readlink -f " ~ byUuidPath);
+                        if (result.status == 0 && result.output.length > 0) {
+                            string actualDevice = result.output.strip();
+                            Logger.info("Found device via UUID: " ~ actualDevice);
+                            sysInfo.device = actualDevice;
+                        }
+                    } catch (Exception e) {
+                        Logger.error("Failed to resolve device by UUID: " ~ e.msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Detect necessary storage controller modules
+     */
+    private string[] detectStorageModules() {
+        import std.process : executeShell;
+        import std.array : array;
+        import std.algorithm : filter, uniq, sort;
+
+        string[] modules;
+
+        try {
+            // Detect NVME controllers
+            auto nvmeResult = executeShell("lspci -k | grep -A2 'Non-Volatile memory controller' | grep 'Kernel driver' | awk '{print $NF}'");
+            if (nvmeResult.status == 0 && nvmeResult.output.length > 0) {
+                auto nvmeModules = nvmeResult.output.strip().split("\n");
+                foreach (mod; nvmeModules) {
+                    if (mod.length > 0 && mod != "nvme") {
+                        modules ~= mod.strip();
+                    }
+                }
+                // Always include nvme if NVME controller detected
+                if (nvmeModules.length > 0) {
+                    modules ~= "nvme";
+                }
+            }
+
+            // Detect SATA/AHCI controllers
+            auto sataResult = executeShell("lspci -k | grep -A2 'SATA\\|AHCI' | grep 'Kernel driver' | awk '{print $NF}'");
+            if (sataResult.status == 0 && sataResult.output.length > 0) {
+                auto sataModules = sataResult.output.strip().split("\n");
+                foreach (mod; sataModules) {
+                    if (mod.length > 0) {
+                        modules ~= mod.strip();
+                    }
+                }
+            }
+
+            // Check for virtio devices (virtual machines)
+            auto virtioResult = executeShell("lspci | grep -i virtio");
+            if (virtioResult.status == 0 && virtioResult.output.length > 0) {
+                modules ~= "virtio_blk";
+                modules ~= "virtio_pci";
+                modules ~= "virtio_scsi";
+            }
+
+            // Check for VMware
+            auto vmwareResult = executeShell("lspci | grep -i vmware");
+            if (vmwareResult.status == 0 && vmwareResult.output.length > 0) {
+                modules ~= "vmw_pvscsi";
+            }
+
+            // Check for Hyper-V
+            auto hypervResult = executeShell("lspci | grep -i 'microsoft\\|hyper-v'");
+            if (hypervResult.status == 0 && hypervResult.output.length > 0) {
+                modules ~= "hv_storvsc";
+                modules ~= "hv_vmbus";
+            }
+
+            // Remove duplicates and sort
+            modules = modules.sort().uniq().array;
+
+            if (modules.length > 0) {
+                Logger.info("Detected storage modules: " ~ modules.join(", "));
+            }
+
+        } catch (Exception e) {
+            Logger.warning("Failed to detect storage modules: " ~ e.msg);
+        }
+
+        return modules;
+    }
+
+    /**
+     * Mount efivars for EFI operations in chroot
+     */
+    private void mountEfiVars(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+
+        string efivarsMountPoint = buildPath(sysInfo.mountPoint, "sys/firmware/efi/efivars");
+
+        try {
+            // Check if efivars directory exists
+            if (!exists(efivarsMountPoint)) {
+                Logger.info("efivars mount point does not exist, skipping");
+                return;
+            }
+
+            // Check if already mounted
+            auto checkResult = executeShell("mountpoint -q " ~ efivarsMountPoint);
+            if (checkResult.status == 0) {
+                Logger.info("efivars already mounted");
+                return;
+            }
+
+            // Try to mount efivars
+            auto mountResult = executeShell("mount -t efivarfs efivarfs " ~ efivarsMountPoint);
+            if (mountResult.status == 0) {
+                Logger.info("Successfully mounted efivars");
+            } else {
+                Logger.warning("Could not mount efivars (normal in some environments)");
+            }
+        } catch (Exception e) {
+            Logger.warning("Exception mounting efivars: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Ensure fallback boot entry exists for rEFInd
+     */
+    private void ensureFallbackBootEntry(ref SystemInfo sysInfo) {
+        import std.file : copy, mkdirRecurse;
+
+        try {
+            string efiBootDir = buildPath(sysInfo.efiDir, "EFI/BOOT");
+            string refindEfi = buildPath(sysInfo.efiDir, "EFI/refind/refind_x64.efi");
+            string fallbackEfi = buildPath(efiBootDir, "bootx64.efi");
+
+            // Check if rEFInd exists
+            if (!exists(refindEfi)) {
+                Logger.warning("rEFInd EFI binary not found at: " ~ refindEfi);
+                return;
+            }
+
+            // Create BOOT directory if it doesn't exist
+            if (!exists(efiBootDir)) {
+                mkdirRecurse(efiBootDir);
+                Logger.info("Created EFI/BOOT directory");
+            }
+
+            // Copy rEFInd as fallback boot loader if not already there
+            if (!exists(fallbackEfi)) {
+                copy(refindEfi, fallbackEfi);
+                Logger.info("Created fallback boot entry at EFI/BOOT/bootx64.efi");
+                ui.printInfo("Created fallback boot entry for rEFInd");
+            } else {
+                Logger.info("Fallback boot entry already exists");
+            }
+
+            // Also copy refind.conf if it exists
+            string refindConf = buildPath(sysInfo.efiDir, "EFI/refind/refind.conf");
+            string fallbackConf = buildPath(efiBootDir, "refind.conf");
+            if (exists(refindConf) && !exists(fallbackConf)) {
+                copy(refindConf, fallbackConf);
+                Logger.info("Copied rEFInd configuration to fallback location");
+            }
+
+        } catch (Exception e) {
+            Logger.warning("Could not create fallback boot entry: " ~ e.msg);
         }
     }
 
@@ -270,7 +614,11 @@ class RepairOperations {
 
             // Always generate proper refind_linux.conf for btrfs systems
             ui.printInfo("Generating rEFInd configuration for btrfs system...");
+            // Generate refind_linux.conf configuration
             success = generateRefindLinuxConf(sysInfo);
+
+            // Mount efivars if not already mounted (needed for efibootmgr)
+            mountEfiVars(sysInfo);
 
             // Also run refind-install if available
             if (exists(buildPath(sysInfo.mountPoint, "usr/bin/refind-install"))) {
@@ -284,6 +632,9 @@ class RepairOperations {
                     ui.printWarning("refind-install had some warnings (this is normal in chroot)");
                 }
             }
+
+            // Ensure fallback boot entry exists
+            ensureFallbackBootEntry(sysInfo);
 
             if (success) {
                 ui.printStatus("✓ rEFInd configuration updated with btrfs support");
@@ -319,14 +670,26 @@ class RepairOperations {
             }
 
             // Generate configuration content
-            string rootParam = "root=UUID=" ~ sysInfo.uuid;
+            string rootParam;
+
+            // Use UUID if available, otherwise fall back to device
+            if (sysInfo.uuid.length > 0) {
+                rootParam = "root=UUID=" ~ sysInfo.uuid;
+            } else {
+                Logger.warning("No UUID available, using device path");
+                rootParam = "root=" ~ sysInfo.device;
+            }
 
             // Add btrfs subvolume if needed
             if (sysInfo.isBtrfs) {
-                // CachyOS typically uses /@ as root subvolume
+                // CachyOS typically uses @ as root subvolume
                 string subvol = sysInfo.btrfsInfo.rootSubvolume;
                 if (subvol.length == 0) {
-                    subvol = "/@";  // Default for CachyOS
+                    subvol = "@";  // Default for CachyOS (without leading slash)
+                }
+                // Ensure subvolume doesn't have leading slash for kernel parameter
+                if (subvol.startsWith("/")) {
+                    subvol = subvol[1..$];
                 }
                 rootParam ~= " rootflags=subvol=" ~ subvol;
                 ui.printInfo("Using btrfs subvolume: " ~ subvol);
@@ -341,7 +704,7 @@ class RepairOperations {
                 "\"Boot with minimal options\"   \"ro root=%s%s\"\n",
                 rootParam, commonParams,
                 rootParam, commonParams,
-                sysInfo.device, sysInfo.isBtrfs ? " rootflags=subvol=/@" : ""
+                sysInfo.device, sysInfo.isBtrfs ? " rootflags=subvol=@" : ""
             );
 
             // Backup existing configuration if it exists
@@ -474,7 +837,15 @@ class RepairOperations {
                 if (!kernel.exists) continue;
 
                 string entryFile = buildPath(entriesDir, kernel.kernelVersion ~ ".conf");
-                string rootParam = "root=UUID=" ~ sysInfo.uuid;
+                string rootParam;
+
+                // Use UUID if available
+                if (sysInfo.uuid.length > 0) {
+                    rootParam = "root=UUID=" ~ sysInfo.uuid;
+                } else {
+                    Logger.warning("No UUID for systemd-boot entry, using device");
+                    rootParam = "root=" ~ sysInfo.device;
+                }
 
                 if (sysInfo.isBtrfs && sysInfo.btrfsInfo.rootSubvolume.length > 0) {
                     rootParam ~= " rootflags=subvol=" ~ sysInfo.btrfsInfo.rootSubvolume;
