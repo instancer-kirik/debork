@@ -27,9 +27,10 @@ class MountManager {
 
             // Detect filesystem type
             if (!detectFilesystemType(sysInfo, device)) {
-                Logger.error("Failed to detect filesystem type for " ~ device);
+                Logger.error("Failed to detect filesystem type for device: " ~ device);
                 return false;
             }
+            Logger.info("Detected filesystem: " ~ sysInfo.fstype ~ (sysInfo.isBtrfs ? " (btrfs)" : ""));
 
             // Store device information
             sysInfo.device = device;
@@ -38,26 +39,36 @@ class MountManager {
             // Mount based on filesystem type
             bool mountSuccess = false;
             if (sysInfo.isBtrfs) {
+                Logger.info("Attempting btrfs mount with subvolume detection");
                 mountSuccess = BtrfsManager.mountWithSubvolume(sysInfo, device);
             } else {
+                Logger.info("Attempting regular filesystem mount");
                 mountSuccess = mountRegularFilesystem(sysInfo, device);
             }
 
             if (!mountSuccess) {
+                Logger.error("Mount operation failed for device: " ~ device);
                 return false;
             }
+            Logger.info("Mount operation successful");
 
             // Set up boot directories
             setupBootDirectories(sysInfo);
 
             // Mount essential directories for chroot
+            Logger.info("Bind mounting essential directories for chroot");
             if (!bindMountEssentialDirectories(sysInfo)) {
                 Logger.warning("Some essential directories failed to mount");
+            } else {
+                Logger.info("Essential directories mounted successfully");
             }
 
             // Mount EFI partition if found
+            Logger.info("Checking for EFI partition");
             if (!mountEfiPartition(sysInfo)) {
                 Logger.info("No EFI partition found or failed to mount");
+            } else {
+                Logger.info("EFI partition mounted successfully");
             }
 
             // Copy network configuration

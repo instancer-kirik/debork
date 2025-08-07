@@ -27,6 +27,7 @@ class BtrfsManager {
 
             if (subvols.length == 0) {
                 Logger.warning("No subvolumes detected, mounting default");
+                Logger.info("No subvolumes detected, mounting with default options");
                 return mountDefault(sysInfo, device);
             }
 
@@ -39,6 +40,10 @@ class BtrfsManager {
                 return mountWithSpecificSubvolume(sysInfo, device, rootSubvol);
             } else {
                 Logger.warning("No root subvolume detected, trying common patterns");
+                // Try CachyOS specific patterns first
+                if (tryMountCachyOS(sysInfo, device)) {
+                    return true;
+                }
                 return tryCommonSubvolumePatterns(sysInfo, device);
             }
 
@@ -46,6 +51,35 @@ class BtrfsManager {
             Logger.error("Exception in btrfs mounting: " ~ e.msg);
             return false;
         }
+    }
+
+    /**
+     * Try to mount CachyOS specific layout
+     */
+    private static bool tryMountCachyOS(ref SystemInfo sysInfo, string device) {
+        Logger.info("Attempting CachyOS-specific mount configuration");
+
+        // CachyOS typically uses @ for root and @home for home
+        string[] cachyPatterns = ["@", "@root"];
+
+        foreach (pattern; cachyPatterns) {
+            Logger.info("Trying CachyOS pattern: " ~ pattern);
+            if (mountWithSpecificSubvolume(sysInfo, device, pattern)) {
+                Logger.info("Successfully mounted with CachyOS pattern: " ~ pattern);
+
+                // Try to mount @home subvolume if it exists
+                string homeMount = sysInfo.mountPoint ~ "/home";
+                if (exists(homeMount)) {
+                    auto homeResult = execute(["mount", "-o", "subvol=@home", device, homeMount]);
+                    if (homeResult.status == 0) {
+                        Logger.info("Mounted @home subvolume");
+                    }
+                }
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -63,7 +97,7 @@ class BtrfsManager {
 
             // Mount temporarily to detect subvolumes
             Logger.debugLog("Temporarily mounting " ~ device ~ " to detect subvolumes");
-            auto mountResult = execute(["mount", device, tempMount]);
+            auto mountResult = execute(["mount", "-o", "ro", device, tempMount]);
             if (mountResult.status != 0) {
                 Logger.error("Failed to temporarily mount for subvolume detection: " ~ mountResult.output);
                 return subvols;

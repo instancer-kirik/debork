@@ -66,8 +66,15 @@ class TUI {
     /**
      * Print error message
      */
-    void printError(string message) {
-        writeln(TermColor.RED ~ "✗ " ~ message ~ TermColor.RESET);
+    void printError(string msg) {
+        writeln(TermColor.RED ~ "✗ " ~ msg ~ TermColor.RESET);
+    }
+
+    /**
+     * Print success message
+     */
+    void printSuccess(string msg) {
+        writeln(TermColor.GREEN ~ "✓ " ~ msg ~ TermColor.RESET);
     }
 
     /**
@@ -93,7 +100,34 @@ class TUI {
             stdout.write("Enter your choice (1-" ~ to!string(options.length) ~ ", or 'q' to quit): ");
             stdout.flush();
 
-            string input = readln().strip();
+            // Fix for stdin issues when running with sudo
+            string input;
+            try {
+                input = readln();
+                if (input is null) {
+                    // stdin might be closed, try to reopen
+                    stdin.reopen("/dev/tty", "r");
+                    input = readln();
+                }
+                input = input.strip();
+            } catch (Exception e) {
+                // Fallback to direct tty reading
+                try {
+                    auto tty = File("/dev/tty", "r");
+                    input = tty.readln().strip();
+                    tty.close();
+                } catch (Exception ttyErr) {
+                    writeln("Error reading input: " ~ ttyErr.msg);
+                    continue;
+                }
+            }
+
+            // Debug logging
+            if (debugMode) {
+                stderr.writeln("[DEBUG] Raw input: '" ~ input ~ "'");
+                stderr.writeln("[DEBUG] Input length: " ~ to!string(input.length));
+                stderr.flush();
+            }
 
             if (input == "q" || input == "Q") {
                 return -1;
@@ -106,7 +140,11 @@ class TUI {
                 }
                 writeln("Invalid choice. Please try again.");
             } catch (Exception e) {
-                writeln("Invalid input. Please enter a number.");
+                writeln("Invalid input. Please enter a number. Input was: '" ~ input ~ "'");
+                if (debugMode) {
+                    stderr.writeln("[DEBUG] Conversion error: " ~ e.msg);
+                    stderr.flush();
+                }
             }
         }
     }
@@ -159,7 +197,25 @@ class TUI {
     string promptInput(string prompt) {
         stdout.write(TermColor.CYAN ~ prompt ~ ": " ~ TermColor.RESET);
         stdout.flush();
-        return readln().strip();
+
+        // Fix for stdin issues when running with sudo
+        string input;
+        try {
+            input = readln();
+            if (input is null) {
+                stdin.reopen("/dev/tty", "r");
+                input = readln();
+            }
+        } catch (Exception e) {
+            try {
+                auto tty = File("/dev/tty", "r");
+                input = tty.readln();
+                tty.close();
+            } catch (Exception ttyErr) {
+                return "";
+            }
+        }
+        return input.strip();
     }
 
     /**
@@ -170,7 +226,24 @@ class TUI {
         stdout.write(TermColor.YELLOW ~ prompt ~ " " ~ defaultText ~ ": " ~ TermColor.RESET);
         stdout.flush();
 
-        string response = readln().strip().toLower();
+        // Fix for stdin issues when running with sudo
+        string response;
+        try {
+            string input = readln();
+            if (input is null) {
+                stdin.reopen("/dev/tty", "r");
+                input = readln();
+            }
+            response = input.strip().toLower();
+        } catch (Exception e) {
+            try {
+                auto tty = File("/dev/tty", "r");
+                response = tty.readln().strip().toLower();
+                tty.close();
+            } catch (Exception ttyErr) {
+                response = "";
+            }
+        }
 
         if (response.length == 0) {
             return defaultValue;
@@ -309,7 +382,23 @@ class TUI {
     void waitForKey(string message = "Press Enter to continue...") {
         writeln(TermColor.YELLOW ~ message ~ TermColor.RESET);
         stdout.flush();
-        readln();
+
+        // Fix for stdin issues when running with sudo
+        try {
+            string input = readln();
+            if (input is null) {
+                stdin.reopen("/dev/tty", "r");
+                readln();
+            }
+        } catch (Exception e) {
+            try {
+                auto tty = File("/dev/tty", "r");
+                tty.readln();
+                tty.close();
+            } catch (Exception ttyErr) {
+                // Ignore errors for wait key
+            }
+        }
     }
 
     /**

@@ -55,9 +55,19 @@ class DeborkApp {
                 return 0;
             }
 
+            ui.printInfo("Selected device: " ~ device);
+            ui.printInfo("Attempting to mount and analyze system...");
+            writeln();
+
             // Mount the system
             if (!mountSystem(device)) {
                 ui.printError("Failed to mount system. Cannot continue.");
+                ui.printError("Please check:");
+                ui.printList([
+                    "The partition is accessible and not corrupted",
+                    "You have sufficient permissions (running as root)",
+                    "The filesystem type is supported"
+                ]);
                 ui.waitForKey();
                 return 1;
             }
@@ -113,6 +123,7 @@ class DeborkApp {
 
         int choice = ui.showMenu(options);
         if (choice == -1) {
+            ui.printInfo("Selection cancelled");
             return "";
         }
 
@@ -121,7 +132,9 @@ class DeborkApp {
             return ui.promptInput("Enter device path to repair (e.g., /dev/nvme0n1p5)");
         }
 
-        return partitions[choice].device;
+        string selectedDevice = partitions[choice].device;
+        ui.printInfo("Selected: " ~ selectedDevice ~ " (" ~ partitions[choice].fstype ~ ")");
+        return selectedDevice;
     }
 
     /**
@@ -136,31 +149,54 @@ class DeborkApp {
             return false;
         }
 
+        ui.printInfo("Device exists, checking mount status...");
+
         // Force unmount if already mounted
         if (MountManager.isDeviceMounted(device)) {
             ui.printWarning("Device is already mounted. Attempting to unmount...");
-            MountManager.forceUnmountDevice(device);
+            if (!MountManager.forceUnmountDevice(device)) {
+                ui.printError("Failed to unmount device. It may be in use.");
+                return false;
+            }
+            ui.printInfo("Device unmounted successfully");
         }
+
+        ui.printInfo("Mounting filesystem...");
 
         // Mount the system
         if (!MountManager.mountSystem(sysInfo, device)) {
             ui.printError("Failed to mount system");
+            ui.printError("Mount operation failed. Check system logs for details.");
             return false;
         }
 
+        ui.printSuccess("Filesystem mounted successfully");
+
         // Detect system information
         ui.printInfo("Analyzing system...");
-        sysInfo.kernels = SystemDetection.detectKernels(sysInfo);
-        sysInfo.bootLoader = SystemDetection.detectBootLoader(sysInfo);
+        try {
+            sysInfo.kernels = SystemDetection.detectKernels(sysInfo);
+            ui.printInfo("Found " ~ to!string(sysInfo.kernels.length) ~ " kernel(s)");
+
+            sysInfo.bootLoader = SystemDetection.detectBootLoader(sysInfo);
+            ui.printInfo("Detected bootloader: " ~ bootLoaderToString(sysInfo.bootLoader));
+        } catch (Exception e) {
+            ui.printError("Error during system analysis: " ~ e.msg);
+            ui.printInfo("Continuing with partial information...");
+        }
 
         // Validate chroot environment
         ui.printInfo("Validating system...");
         if (!ChrootManager.validateChrootEnvironment(sysInfo)) {
             ui.printWarning("System validation failed");
             ui.printInfo("You can still try using the Emergency Shell or Diagnostics");
+        } else {
+            ui.printSuccess("System validation passed");
         }
 
         ui.printStatus("System mounted and analyzed successfully");
+        ui.printInfo("Press any key to continue to repair menu...");
+        ui.waitForKey();
         return true;
     }
 
@@ -193,7 +229,13 @@ class DeborkApp {
 
         while (true) {
             ui.printHeader();
+            ui.printInfo("System: " ~ sysInfo.mountPoint);
+            ui.printInfo("Filesystem: " ~ sysInfo.fstype);
+            writeln();
+
             int choice = ui.showMenu(mainMenu);
+
+            ui.printInfo("You selected option: " ~ to!string(choice + 1));
 
             switch (choice) {
                 case 0: // Complete Repair

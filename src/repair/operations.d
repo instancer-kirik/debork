@@ -266,19 +266,29 @@ class RepairOperations {
         Logger.info("Fixing rEFInd bootloader");
 
         try {
-            // Method 1: Use refind-install if available
+            bool success = false;
+
+            // Always generate proper refind_linux.conf for btrfs systems
+            ui.printInfo("Generating rEFInd configuration for btrfs system...");
+            success = generateRefindLinuxConf(sysInfo);
+
+            // Also run refind-install if available
             if (exists(buildPath(sysInfo.mountPoint, "usr/bin/refind-install"))) {
+                ui.printInfo("Running refind-install to update EFI entries...");
                 auto process = ChrootManager.executeChrootDirect(sysInfo, ["refind-install"]);
                 auto exitCode = wait(process);
 
                 if (exitCode == 0) {
-                    ui.printStatus("✓ rEFInd configuration updated");
-                    return true;
+                    ui.printStatus("✓ rEFInd install completed");
+                } else {
+                    ui.printWarning("refind-install had some warnings (this is normal in chroot)");
                 }
             }
 
-            // Method 2: Manual refind_linux.conf generation
-            return generateRefindLinuxConf(sysInfo);
+            if (success) {
+                ui.printStatus("✓ rEFInd configuration updated with btrfs support");
+            }
+            return success;
 
         } catch (Exception e) {
             Logger.error("Exception fixing rEFInd: " ~ e.msg);
@@ -294,44 +304,119 @@ class RepairOperations {
             string bootPath = sysInfo.bootDir;
             string refindConfPath = buildPath(bootPath, "refind_linux.conf");
 
-            // Find the best kernel to use
-            KernelInfo bestKernel;
-            foreach (kernel; sysInfo.kernels) {
-                if (kernel.exists) {
-                    bestKernel = kernel;
-                    break;
+            // Detect the actual UUID if not already set
+            if (sysInfo.uuid.length == 0) {
+                try {
+                    auto uuidResult = execute(["blkid", "-s", "UUID", "-o", "value", sysInfo.device]);
+                    if (uuidResult.status == 0) {
+                        sysInfo.uuid = uuidResult.output.strip();
+                        Logger.info("Detected UUID: " ~ sysInfo.uuid);
+                    }
+                } catch (Exception e) {
+                    Logger.error("Failed to detect UUID: " ~ e.msg);
+                    ui.printWarning("Could not detect UUID, using device path instead");
                 }
-            }
-
-            if (bestKernel.path.length == 0) {
-                ui.printError("No usable kernel found for rEFInd configuration");
-                return false;
             }
 
             // Generate configuration content
             string rootParam = "root=UUID=" ~ sysInfo.uuid;
-            if (sysInfo.isBtrfs && sysInfo.btrfsInfo.rootSubvolume.length > 0) {
-                rootParam ~= " rootflags=subvol=" ~ sysInfo.btrfsInfo.rootSubvolume;
+
+            // Add btrfs subvolume if needed
+            if (sysInfo.isBtrfs) {
+                // CachyOS typically uses /@ as root subvolume
+                string subvol = sysInfo.btrfsInfo.rootSubvolume;
+                if (subvol.length == 0) {
+                    subvol = "/@";  // Default for CachyOS
+                }
+                rootParam ~= " rootflags=subvol=" ~ subvol;
+                ui.printInfo("Using btrfs subvolume: " ~ subvol);
             }
 
+            // Add common CachyOS boot parameters
+            string commonParams = "quiet zswap.enabled=0 nowatchdog splash rw";
+
             string content = format(
-                "\"Boot with standard options\" \"%s initrd=%s %s rw\"\n" ~
-                "\"Boot to terminal\"            \"%s initrd=%s %s rw systemd.unit=multi-user.target\"\n" ~
-                "\"Boot with nomodeset\"         \"%s initrd=%s %s rw nomodeset\"\n",
-                bestKernel.path, bestKernel.initrd, rootParam,
-                bestKernel.path, bestKernel.initrd, rootParam,
-                bestKernel.path, bestKernel.initrd, rootParam
+                "\"Boot with standard options\"  \"%s %s\"\n" ~
+                "\"Boot to single-user mode\"    \"%s %s single\"\n" ~
+                "\"Boot with minimal options\"   \"ro root=%s%s\"\n",
+                rootParam, commonParams,
+                rootParam, commonParams,
+                sysInfo.device, sysInfo.isBtrfs ? " rootflags=subvol=/@" : ""
             );
+
+            // Backup existing configuration if it exists
+            if (exists(refindConfPath)) {
+                string backupPath = refindConfPath ~ ".backup";
+                copy(refindConfPath, backupPath);
+                Logger.info("Backed up existing configuration to: " ~ backupPath);
+            }
 
             // Write configuration file
             write(refindConfPath, content);
             Logger.info("Generated rEFInd configuration: " ~ refindConfPath);
-            ui.printStatus("✓ Generated rEFInd configuration");
+            ui.printSuccess("Generated rEFInd configuration with btrfs support");
+            ui.printInfo("Configuration written to: " ~ refindConfPath);
+
+            // Also fix the EFI bootloader entries if needed
+            fixEfiBootEntries(sysInfo);
 
             return true;
 
         } catch (Exception e) {
-            Logger.error("Failed to generate rEFInd configuration: " ~ e.msg);
+            Logger.error("Exception generating rEFInd configuration: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Fix EFI boot entries for CachyOS
+     */
+    private bool fixEfiBootEntries(ref SystemInfo sysInfo) {
+        try {
+            // Check if we have kernels in /boot
+            string bootDir = sysInfo.bootDir;
+            string[] kernelFiles;
+
+            foreach (DirEntry e; dirEntries(bootDir, SpanMode.shallow)) {
+                if (e.isFile && e.name.baseName.startsWith("vmlinuz-")) {
+                    kernelFiles ~= e.name;
+                    Logger.info("Found kernel: " ~ e.name);
+                }
+            }
+
+            // For CachyOS with rEFInd, ensure kernel is accessible
+            foreach (kernelFile; kernelFiles) {
+                string kernelName = baseName(kernelFile);
+                string efiKernelPath = buildPath(sysInfo.mountPoint, "boot", "efi", "EFI", "CachyOS", kernelName);
+                string sourceKernelPath = buildPath(bootDir, kernelName);
+
+                // Also copy initramfs
+                string initramfsName = kernelName.replace("vmlinuz-", "initramfs-") ~ ".img";
+                string efiInitramfsPath = buildPath(sysInfo.mountPoint, "boot", "efi", "EFI", "CachyOS", initramfsName);
+                string sourceInitramfsPath = buildPath(bootDir, initramfsName);
+
+                // Create CachyOS directory if it doesn't exist
+                string efiCachyDir = buildPath(sysInfo.mountPoint, "boot", "efi", "EFI", "CachyOS");
+                if (!exists(efiCachyDir)) {
+                    mkdirRecurse(efiCachyDir);
+                    Logger.info("Created EFI CachyOS directory");
+                }
+
+                // Copy kernel and initramfs to EFI partition if they don't exist there
+                if (exists(sourceKernelPath) && !exists(efiKernelPath)) {
+                    copy(sourceKernelPath, efiKernelPath);
+                    Logger.info("Copied kernel to EFI partition: " ~ kernelName);
+                }
+
+                if (exists(sourceInitramfsPath) && !exists(efiInitramfsPath)) {
+                    copy(sourceInitramfsPath, efiInitramfsPath);
+                    Logger.info("Copied initramfs to EFI partition: " ~ initramfsName);
+                }
+            }
+
+            return true;
+        } catch (Exception e) {
+            Logger.error("Exception fixing EFI boot entries: " ~ e.msg);
             return false;
         }
     }
