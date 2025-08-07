@@ -1,0 +1,58 @@
+# Compiled binaries
+debork
+debork-static
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Build directories
+bin/
+build/
+.dub/
+dub.selections.json
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Debug files
+*.pdb
+*.ilk
+*.exp
+
+# Logs
+*.log
+/tmp/
+
+# Documentation
+docs.json
+__dummy.html
+docs/
+
+# Test coverage
+*.lst
+coverage/
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*.old

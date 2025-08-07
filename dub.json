@@ -1,0 +1,58 @@
+{
+  "name": "debork",
+  "description": "Cross-Platform Linux Boot Rescue Tool",
+  "authors": ["debork contributors"],
+  "homepage": "https://github.com/debork/debork",
+  "license": "MIT",
+  "targetType": "executable",
+  "targetName": "debork",
+  "mainSourceFile": "src/main.d",
+  "sourcePaths": ["src"],
+  "importPaths": ["src"],
+  "versions": ["Have_debork"],
+  "buildRequirements": ["allowWarnings"],
+  "dflags": ["-J."],
+  "buildTypes": {
+    "debug": {
+      "buildOptions": ["debugMode", "debugInfo"],
+      "dflags": ["-g", "-debug"]
+    },
+    "release": {
+      "buildOptions": ["releaseMode", "optimize", "inline"],
+      "dflags": ["-O", "-release", "-inline"]
+    },
+    "unittest": {
+      "buildOptions": ["unittests", "debugMode", "debugInfo"],
+      "dflags": ["-unittest", "-g", "-debug"]
+    },
+    "profile": {
+      "buildOptions": ["releaseMode", "optimize", "profile"],
+      "dflags": ["-O", "-release", "-profile"]
+    }
+  },
+  "configurations": [
+    {
+      "name": "application",
+      "targetType": "executable",
+      "targetName": "debork"
+    },
+    {
+      "name": "static",
+      "targetType": "executable",
+      "targetName": "debork-static",
+      "dflags": ["-static"]
+    }
+  ],
+
+  "toolchainRequirements": {
+    "dmd": ">=2.090.0",
+    "ldc": ">=1.20.0",
+    "gdc": ">=9.0.0"
+  },
+  "preGenerateCommands": ["mkdir -p bin"],
+  "postBuildCommands": [
+    "cp debork bin/ 2>/dev/null || cp debork-static bin/ 2>/dev/null || true"
+  ],
+  "stringImportPaths": ["."],
+  "systemDependencies": "Requires: mount, umount, chroot, blkid utilities"
+}
