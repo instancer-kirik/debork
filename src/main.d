@@ -49,18 +49,18 @@ class DeborkApp {
             writeln();
 
             // Select partition to repair
-            string device = selectPartition();
-            if (device.length == 0) {
+            PartitionInfo selectedPartition = selectPartition();
+            if (selectedPartition.device.length == 0) {
                 ui.printInfo("No device selected. Exiting...");
                 return 0;
             }
 
-            ui.printInfo("Selected device: " ~ device);
+            ui.printInfo("Selected device: " ~ selectedPartition.device);
             ui.printInfo("Attempting to mount and analyze system...");
             writeln();
 
             // Mount the system
-            if (!mountSystem(device)) {
+            if (!mountSystem(selectedPartition)) {
                 ui.printError("Failed to mount system. Cannot continue.");
                 ui.printError("Please check:");
                 ui.printList([
@@ -91,13 +91,15 @@ class DeborkApp {
     /**
      * Select partition to repair
      */
-    private string selectPartition() {
+    private PartitionInfo selectPartition() {
         ui.printInfo("Scanning for Linux partitions...");
         auto partitions = SystemDetection.scanPartitions();
 
         if (partitions.length == 0) {
             ui.printWarning("No Linux partitions detected automatically");
-            return ui.promptInput("Enter device path to repair (e.g., /dev/nvme0n1p5)");
+            PartitionInfo manual;
+            manual.device = ui.promptInput("Enter device path to repair (e.g., /dev/nvme0n1p5)");
+            return manual;
         }
 
         // Create menu options
@@ -124,37 +126,48 @@ class DeborkApp {
         int choice = ui.showMenu(options);
         if (choice == -1) {
             ui.printInfo("Selection cancelled");
-            return "";
+            return PartitionInfo.init;
         }
 
         if (choice >= partitions.length) {
             // Manual entry
-            return ui.promptInput("Enter device path to repair (e.g., /dev/nvme0n1p5)");
+            PartitionInfo manual;
+            manual.device = ui.promptInput("Enter device path to repair (e.g., /dev/nvme0n1p5)");
+            return manual;
         }
 
-        string selectedDevice = partitions[choice].device;
-        ui.printInfo("Selected: " ~ selectedDevice ~ " (" ~ partitions[choice].fstype ~ ")");
-        return selectedDevice;
+        PartitionInfo selectedPartition = partitions[choice];
+        ui.printInfo("Selected: " ~ selectedPartition.device ~ " (" ~ selectedPartition.fstype ~ ")");
+        if (selectedPartition.uuid.length > 0) {
+            ui.printInfo("UUID: " ~ selectedPartition.uuid);
+        }
+        return selectedPartition;
     }
 
     /**
      * Mount the selected system
      */
-    private bool mountSystem(string device) {
-        ui.printInfo("Mounting system from " ~ device);
+    private bool mountSystem(PartitionInfo partition) {
+        ui.printInfo("Mounting system from " ~ partition.device);
+
+        // Pre-populate UUID if we already have it from partition scan
+        if (partition.uuid.length > 0) {
+            sysInfo.uuid = partition.uuid;
+            ui.printInfo("Using detected UUID: " ~ partition.uuid);
+        }
 
         // Check if device exists
-        if (!exists(device)) {
-            ui.printError("Device does not exist: " ~ device);
+        if (!exists(partition.device)) {
+            ui.printError("Device does not exist: " ~ partition.device);
             return false;
         }
 
         ui.printInfo("Device exists, checking mount status...");
 
         // Force unmount if already mounted
-        if (MountManager.isDeviceMounted(device)) {
+        if (MountManager.isDeviceMounted(partition.device)) {
             ui.printWarning("Device is already mounted. Attempting to unmount...");
-            if (!MountManager.forceUnmountDevice(device)) {
+            if (!MountManager.forceUnmountDevice(partition.device)) {
                 ui.printError("Failed to unmount device. It may be in use.");
                 return false;
             }
@@ -164,7 +177,7 @@ class DeborkApp {
         ui.printInfo("Mounting filesystem...");
 
         // Mount the system
-        if (!MountManager.mountSystem(sysInfo, device)) {
+        if (!MountManager.mountSystem(sysInfo, partition.device)) {
             ui.printError("Failed to mount system");
             ui.printError("Mount operation failed. Check system logs for details.");
             return false;
@@ -213,8 +226,10 @@ class DeborkApp {
                       "Rebuild initramfs for all kernels", true),
             MenuOption("Fix Bootloader Only",
                       "Repair bootloader configuration", true),
-            MenuOption("Install Essential Packages",
-                      "Install missing core system packages", true),
+            MenuOption("Clean & Fix rEFInd",
+                      "Clean duplicate entries and fix rEFInd configuration", true),
+            MenuOption("Fix Dual-EFI Boot",
+                      "Fix boot with /boot on separate EFI partition", true),
             MenuOption("Show System Information",
                       "Display detected system details", true),
             MenuOption("Diagnose System Issues",
@@ -226,8 +241,9 @@ class DeborkApp {
         ];
 
         auto repairOps = new RepairOperations(ui);
+        bool shouldExit = false;
 
-        while (true) {
+        while (!shouldExit) {
             ui.printHeader();
             ui.printInfo("System: " ~ sysInfo.mountPoint);
             ui.printInfo("Filesystem: " ~ sysInfo.fstype);
@@ -254,30 +270,39 @@ class DeborkApp {
                     fixBootloader(repairOps);
                     break;
 
-                case 4: // Install Essential Packages
-                    installEssentialPackages(repairOps);
+                case 4: // Clean & Fix rEFInd
+                    cleanAndFixRefind(repairOps);
                     break;
 
-                case 5: // Show System Info
+                case 5: // Fix Dual-EFI Boot
+                    fixDualEfiBoot(repairOps);
+                    break;
+
+                case 6: // Show System Info
                     showSystemInformation();
                     break;
 
-                case 6: // Diagnose Issues
+                case 7: // Diagnose System
                     diagnoseSystem();
                     break;
 
-                case 7: // Advanced Options
+                case 8: // Advanced Options
                     showAdvancedMenu(repairOps);
                     break;
 
-                case 8: // Exit
+                case 9: // Exit
+                    shouldExit = true;
+                    break;
                 case -1: // Quit
-                    return 0;
+                    shouldExit = true;
+                    break;
 
                 default:
                     break;
             }
         }
+
+        return 0;
     }
 
     /**
@@ -375,12 +400,75 @@ class DeborkApp {
      */
     private void fixBootloader(RepairOperations repairOps) {
         ui.printHeader();
-        ui.printInfo("Fixing bootloader: " ~ bootLoaderToString(sysInfo.bootLoader));
+        ui.printInfo("Fixing bootloader configuration...");
 
         if (repairOps.fixBootloader(sysInfo)) {
             ui.printStatus("✓ Bootloader repair completed");
         } else {
             ui.printError("Bootloader repair failed");
+        }
+
+        ui.waitForKey();
+    }
+
+    /**
+     * Clean and fix rEFInd specifically
+     */
+    private void cleanAndFixRefind(RepairOperations repairOps) {
+        ui.printHeader();
+        ui.printInfo("Cleaning and fixing rEFInd bootloader...");
+
+        // Check if rEFInd is the detected bootloader
+        if (sysInfo.bootLoader != BootLoader.REFIND) {
+            ui.printWarning("rEFInd not detected as the bootloader");
+            ui.printInfo("Current bootloader: " ~ bootLoaderToString(sysInfo.bootLoader));
+
+            string response = ui.promptInput("Force rEFInd repair anyway? (y/n)");
+            if (response.toLower() != "y" && response.toLower() != "yes") {
+                ui.waitForKey();
+                return;
+            }
+
+            sysInfo.bootLoader = BootLoader.REFIND;
+        }
+
+        ui.printInfo("Cleaning duplicate rEFInd entries...");
+        ui.printInfo("Regenerating rEFInd configuration...");
+        ui.printInfo("Verifying boot parameters...");
+
+        if (repairOps.fixBootloader(sysInfo)) {
+            ui.printStatus("✓ rEFInd cleanup and repair completed");
+            ui.printInfo("");
+            ui.printInfo("rEFInd should now have:");
+            ui.printInfo("  • Cleaned up duplicate entries");
+            ui.printInfo("  • Proper root device parameters");
+            ui.printInfo("  • Correct btrfs subvolume settings");
+            ui.printInfo("  • Valid refind_linux.conf in /boot");
+        } else {
+            ui.printError("rEFInd repair failed");
+        }
+
+        ui.waitForKey();
+    }
+
+    /**
+     * Fix dual-EFI boot setup
+     */
+    private void fixDualEfiBoot(RepairOperations repairOps) {
+        ui.printHeader();
+        ui.printInfo("Fixing dual-EFI boot configuration...");
+        ui.printInfo("This handles the case where /boot is on a separate EFI partition");
+
+        // Force the dual-EFI fix
+        if (repairOps.fixDualEfiRefind(sysInfo)) {
+            ui.printStatus("✓ Dual-EFI boot configuration fixed");
+            ui.printInfo("");
+            ui.printInfo("The system should now boot with:");
+            ui.printInfo("  • Kernel loaded from first EFI partition");
+            ui.printInfo("  • rEFInd configured with correct volume");
+            ui.printInfo("  • Proper root device parameters");
+        } else {
+            ui.printError("Failed to fix dual-EFI boot configuration");
         }
 
         ui.waitForKey();

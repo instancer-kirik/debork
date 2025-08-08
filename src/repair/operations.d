@@ -354,16 +354,43 @@ class RepairOperations {
             try {
                 // Try blkid first
                 auto result = executeShell("blkid -s UUID -o value " ~ sysInfo.device);
-                if (result.status == 0 && result.output.length > 0) {
+                if (result.status == 0 && result.output.strip().length > 0) {
                     sysInfo.uuid = result.output.strip();
                     Logger.info("Detected UUID: " ~ sysInfo.uuid);
                     ui.printInfo("Found filesystem UUID: " ~ sysInfo.uuid);
                 } else {
                     // Try lsblk as fallback
                     result = executeShell("lsblk -no UUID " ~ sysInfo.device ~ " | head -n1");
-                    if (result.status == 0 && result.output.length > 0) {
+                    if (result.status == 0 && result.output.strip().length > 0) {
                         sysInfo.uuid = result.output.strip();
                         Logger.info("Detected UUID via lsblk: " ~ sysInfo.uuid);
+                    } else {
+                        // Try blkid with full output parsing
+                        result = executeShell("blkid " ~ sysInfo.device);
+                        if (result.status == 0) {
+                            auto output = result.output;
+                            auto uuidStart = output.indexOf("UUID=\"");
+                            if (uuidStart != -1) {
+                                uuidStart += 6;
+                                auto uuidEnd = output.indexOf("\"", uuidStart);
+                                if (uuidEnd != -1) {
+                                    sysInfo.uuid = output[uuidStart .. uuidEnd];
+                                    Logger.info("Detected UUID from blkid output: " ~ sysInfo.uuid);
+                                    ui.printInfo("Found filesystem UUID: " ~ sysInfo.uuid);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // If still no UUID, try to get PARTUUID as last resort
+                if (sysInfo.uuid.length == 0) {
+                    result = executeShell("blkid -s PARTUUID -o value " ~ sysInfo.device);
+                    if (result.status == 0 && result.output.strip().length > 0) {
+                        // Store PARTUUID but note it's different
+                        sysInfo.uuid = result.output.strip();
+                        Logger.warning("Using PARTUUID instead of UUID: " ~ sysInfo.uuid);
+                        ui.printWarning("Using PARTUUID (not filesystem UUID): " ~ sysInfo.uuid);
                     }
                 }
             } catch (Exception e) {
@@ -542,6 +569,11 @@ class RepairOperations {
         ui.printInfo("  UUID: " ~ (sysInfo.uuid.length > 0 ? sysInfo.uuid : "NOT DETECTED"));
         ui.printInfo("  Filesystem: " ~ sysInfo.fstype);
 
+        // Show if btrfs subvolume is detected
+        if (sysInfo.isBtrfs) {
+            ui.printInfo("  Btrfs root subvolume: " ~ sysInfo.btrfsInfo.rootSubvolume);
+        }
+
         if (sysInfo.uuid.length == 0) {
             ui.printError("CRITICAL: No UUID detected - boot will fail!");
 
@@ -549,6 +581,11 @@ class RepairOperations {
             auto blkidResult = executeShell("blkid " ~ sysInfo.device);
             if (blkidResult.status == 0) {
                 ui.printInfo("blkid output: " ~ blkidResult.output.strip());
+            }
+
+            // Also check if device exists
+            if (!exists(sysInfo.device)) {
+                ui.printError("CRITICAL: Device does not exist: " ~ sysInfo.device);
             }
         }
 
@@ -765,26 +802,45 @@ class RepairOperations {
         try {
             bool success = false;
 
+            // Check for dual-EFI setup (kernel on different partition than rEFInd)
+            bool isDualEfiSetup = detectDualEfiSetup(sysInfo);
+            if (isDualEfiSetup) {
+                ui.printInfo("Detected dual-EFI partition setup");
+                return fixDualEfiRefind(sysInfo);
+            }
+
+            // First, detect where rEFInd is actually installed
+            string refindLocation = detectRefindInstallation(sysInfo);
+            if (refindLocation.length == 0) {
+                ui.printWarning("rEFInd not found, installing...");
+                installRefindProperly(sysInfo);
+                refindLocation = detectRefindInstallation(sysInfo);
+            }
+
+            // Clean up wrongly placed kernels in EFI partition
+            ui.printInfo("Cleaning up misplaced files...");
+            cleanupMisplacedKernels(sysInfo);
+
+            // First, clean up duplicate and incorrect rEFInd entries
+            ui.printInfo("Cleaning up rEFInd entries...");
+            cleanupRefindEntries(sysInfo);
+
             // Always generate proper refind_linux.conf for btrfs systems
             ui.printInfo("Generating rEFInd configuration for btrfs system...");
             // Generate refind_linux.conf configuration
             success = generateRefindLinuxConf(sysInfo);
 
+            // Verify the configuration was actually written correctly
+            verifyRefindLinuxConf(sysInfo);
+
+            // Configure rEFInd to scan /boot for kernels
+            configureRefindScanPaths(sysInfo, refindLocation);
+
+            // Also create manual boot stanza in refind.conf for reliability
+            createRefindManualStanza(sysInfo);
+
             // Mount efivars if not already mounted (needed for efibootmgr)
             mountEfiVars(sysInfo);
-
-            // Also run refind-install if available
-            if (exists(buildPath(sysInfo.mountPoint, "usr/bin/refind-install"))) {
-                ui.printInfo("Running refind-install to update EFI entries...");
-                auto process = ChrootManager.executeChrootDirect(sysInfo, ["refind-install"]);
-                auto exitCode = wait(process);
-
-                if (exitCode == 0) {
-                    ui.printStatus("✓ rEFInd install completed");
-                } else {
-                    ui.printWarning("refind-install had some warnings (this is normal in chroot)");
-                }
-            }
 
             // Ensure fallback boot entry exists
             ensureFallbackBootEntry(sysInfo);
@@ -797,6 +853,581 @@ class RepairOperations {
         } catch (Exception e) {
             Logger.error("Exception fixing rEFInd: " ~ e.msg);
             return false;
+        }
+    }
+
+    /**
+     * Detect dual-EFI partition setup
+     */
+    private bool detectDualEfiSetup(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+
+        try {
+            // Check if /boot is on a different partition than /boot/efi
+            auto bootDev = executeShell("df /boot | tail -1 | awk '{print $1}'");
+            auto efiDev = executeShell("df /boot/efi | tail -1 | awk '{print $1}'");
+
+            if (bootDev.status == 0 && efiDev.status == 0) {
+                string bootPartition = bootDev.output.strip();
+                string efiPartition = efiDev.output.strip();
+
+                // Check if both are FAT partitions (unusual setup)
+                auto bootFs = executeShell("blkid -s TYPE -o value " ~ bootPartition);
+                auto efiFs = executeShell("blkid -s TYPE -o value " ~ efiPartition);
+
+                if (bootFs.status == 0 && efiFs.status == 0) {
+                    string bootFsType = bootFs.output.strip().toLower();
+                    string efiFsType = efiFs.output.strip().toLower();
+
+                    if ((bootFsType.canFind("fat") || bootFsType.canFind("vfat")) &&
+                        (efiFsType.canFind("fat") || efiFsType.canFind("vfat")) &&
+                        bootPartition != efiPartition) {
+                        Logger.info("Dual-EFI setup detected: /boot on " ~ bootPartition ~ ", /boot/efi on " ~ efiPartition);
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Logger.warning("Could not detect dual-EFI setup: " ~ e.msg);
+        }
+
+        return false;
+    }
+
+    /**
+     * Fix rEFInd for dual-EFI partition setup
+     */
+    bool fixDualEfiRefind(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+
+        ui.printInfo("Handling dual-EFI partition configuration...");
+
+        try {
+            // Get the UUID of the boot partition (where kernel is)
+            auto bootResult = executeShell("df /boot | tail -1 | awk '{print $1}'");
+            if (bootResult.status != 0) {
+                ui.printError("Could not determine boot partition");
+                return false;
+            }
+
+            string bootDevice = bootResult.output.strip();
+
+            // Get the UUID/label of the boot partition
+            auto uuidResult = executeShell("blkid -s UUID -o value " ~ bootDevice);
+            string bootVolumeId = uuidResult.status == 0 ? uuidResult.output.strip() : "";
+
+            // If no UUID, try label
+            if (bootVolumeId.length == 0) {
+                auto labelResult = executeShell("blkid -s LABEL -o value " ~ bootDevice);
+                bootVolumeId = labelResult.status == 0 ? labelResult.output.strip() : "";
+            }
+
+            if (bootVolumeId.length == 0) {
+                ui.printError("Could not determine boot volume identifier");
+                return false;
+            }
+
+            ui.printInfo("Boot partition volume: " ~ bootVolumeId);
+
+            // Clean up misplaced initramfs files from EFI partition
+            cleanupDualEfiMisplacedFiles(sysInfo);
+
+            // Ensure refind_linux.conf is correct
+            generateRefindLinuxConf(sysInfo);
+            verifyRefindLinuxConf(sysInfo);
+
+            // Add manual entry to rEFInd
+            string refindConfPath = buildPath(sysInfo.efiDir, "EFI/refind/refind.conf");
+
+            if (!exists(refindConfPath)) {
+                ui.printWarning("refind.conf not found, creating basic configuration");
+                createBasicRefindConf(refindConfPath);
+            }
+
+            // Check if manual entry already exists
+            import std.file : readText;
+            string refindContent = readText(refindConfPath);
+
+            if (refindContent.indexOf("menuentry \"CachyOS Linux\"") == -1) {
+                ui.printInfo("Adding manual boot entry for CachyOS...");
+
+                // Backup configuration
+                copy(refindConfPath, refindConfPath ~ ".bak");
+
+                // Add manual entry
+                string manualEntry = "\n\n# Manual CachyOS entry for dual-EFI setup\n";
+                manualEntry ~= "menuentry \"CachyOS Linux\" {\n";
+                manualEntry ~= "    icon     /EFI/refind/icons/os_arch.png\n";
+                manualEntry ~= "    volume   " ~ bootVolumeId ~ "\n";
+                manualEntry ~= "    loader   /vmlinuz-linux-cachyos\n";
+                manualEntry ~= "    initrd   /initramfs-linux-cachyos.img\n";
+                manualEntry ~= "    options  \"root=UUID=" ~ sysInfo.uuid ~ " rootflags=subvol=@ rw quiet splash\"\n";
+                manualEntry ~= "}\n";
+
+                append(refindConfPath, manualEntry);
+                ui.printSuccess("Added manual CachyOS entry to rEFInd");
+
+                // Also add exclusions to reduce duplicates
+                if (refindContent.indexOf("dont_scan_volumes") == -1) {
+                    append(refindConfPath, "\n# Hide duplicate entries\n");
+                    append(refindConfPath, "dont_scan_volumes " ~ bootVolumeId ~ "\n");
+                }
+            } else {
+                ui.printInfo("Manual CachyOS entry already exists");
+            }
+
+            ui.printSuccess("Dual-EFI rEFInd configuration completed");
+            ui.printInfo("Look for 'CachyOS Linux' entry in rEFInd menu");
+
+            return true;
+
+        } catch (Exception e) {
+            Logger.error("Failed to fix dual-EFI rEFInd: " ~ e.msg);
+            ui.printError("Could not configure rEFInd for dual-EFI setup");
+            return false;
+        }
+    }
+
+    /**
+     * Clean up misplaced files in dual-EFI setup
+     */
+    private void cleanupDualEfiMisplacedFiles(ref SystemInfo sysInfo) {
+        import std.file : remove, dirEntries, SpanMode;
+        import std.path : baseName;
+
+        try {
+            // Only remove initramfs from EFI directories (kernels should stay in /boot)
+            string[] checkDirs = [
+                buildPath(sysInfo.efiDir, "EFI/CachyOS"),
+                buildPath(sysInfo.efiDir, "EFI/Linux"),
+                buildPath(sysInfo.efiDir, "EFI/cachyos"),
+                buildPath(sysInfo.efiDir, "EFI/linux")
+            ];
+
+            foreach (dir; checkDirs) {
+                if (exists(dir)) {
+                    foreach (entry; dirEntries(dir, "initramfs*", SpanMode.shallow)) {
+                        ui.printInfo("Removing misplaced: " ~ baseName(entry.name));
+                        try {
+                            remove(entry.name);
+                        } catch (Exception e) {
+                            Logger.warning("Could not remove: " ~ e.msg);
+                        }
+                    }
+
+                    // Remove directory if empty
+                    try {
+                        auto remaining = dirEntries(dir, SpanMode.shallow);
+                        if (remaining.empty) {
+                            rmdir(dir);
+                            ui.printInfo("Removed empty directory: " ~ baseName(dir));
+                        }
+                    } catch (Exception e) {
+                        // Directory not empty or couldn't remove
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Logger.warning("Error cleaning dual-EFI misplaced files: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Create basic refind.conf if missing
+     */
+    private void createBasicRefindConf(string path) {
+        import std.file : write, mkdirRecurse;
+        import std.path : dirName;
+
+        try {
+            mkdirRecurse(dirName(path));
+
+            string basicConf = "# rEFInd configuration\n";
+            basicConf ~= "timeout 10\n";
+            basicConf ~= "use_nvram false\n";
+            basicConf ~= "scanfor manual,external,optical,internal\n";
+            basicConf ~= "scan_all_linux_kernels true\n\n";
+
+            write(path, basicConf);
+            Logger.info("Created basic refind.conf");
+        } catch (Exception e) {
+            Logger.error("Could not create refind.conf: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Detect where rEFInd is installed
+     */
+    private string detectRefindInstallation(ref SystemInfo sysInfo) {
+        string[] possibleLocations = [
+            buildPath(sysInfo.efiDir, "EFI/refind"),
+            buildPath(sysInfo.efiDir, "EFI/BOOT"),
+            buildPath(sysInfo.efiDir, "EFI/boot"),
+            buildPath(sysInfo.efiDir, "EFI/rEFInd")
+        ];
+
+        foreach (location; possibleLocations) {
+            string refindEfi = buildPath(location, "refind_x64.efi");
+            string bootEfi = buildPath(location, "bootx64.efi");
+
+            if (exists(refindEfi) || (exists(bootEfi) && exists(buildPath(location, "refind.conf")))) {
+                Logger.info("Found rEFInd at: " ~ location);
+                ui.printInfo("rEFInd located at: " ~ location);
+                return location;
+            }
+        }
+
+        Logger.warning("rEFInd installation not found");
+        return "";
+    }
+
+    /**
+     * Install rEFInd properly
+     */
+    private void installRefindProperly(ref SystemInfo sysInfo) {
+        try {
+            if (exists(buildPath(sysInfo.mountPoint, "usr/bin/refind-install"))) {
+                ui.printInfo("Installing rEFInd...");
+                auto process = ChrootManager.executeChrootDirect(sysInfo, ["refind-install"]);
+                auto exitCode = wait(process);
+
+                if (exitCode == 0) {
+                    ui.printStatus("✓ rEFInd installed successfully");
+                } else {
+                    ui.printWarning("rEFInd installation had warnings");
+                }
+            } else {
+                ui.printError("refind-install not found, please install refind package");
+            }
+        } catch (Exception e) {
+            Logger.error("Failed to install rEFInd: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Clean up misplaced kernels from EFI partition
+     */
+    private void cleanupMisplacedKernels(ref SystemInfo sysInfo) {
+        import std.file : remove;
+        import std.path : baseName;
+
+        try {
+            // Remove kernels that shouldn't be in EFI/CachyOS or EFI/Linux
+            string[] wrongLocations = [
+                buildPath(sysInfo.efiDir, "EFI/CachyOS"),
+                buildPath(sysInfo.efiDir, "EFI/Linux"),
+                buildPath(sysInfo.efiDir, "EFI/cachyos"),
+                buildPath(sysInfo.efiDir, "EFI/linux")
+            ];
+
+            foreach (location; wrongLocations) {
+                if (exists(location)) {
+                    // Remove vmlinuz files (kernels don't belong here)
+                    foreach (entry; dirEntries(location, "vmlinuz*", SpanMode.shallow)) {
+                        Logger.info("Removing misplaced kernel: " ~ entry.name);
+                        ui.printInfo("Removing kernel from EFI: " ~ baseName(entry.name));
+                        try {
+                            remove(entry.name);
+                        } catch (Exception e) {
+                            Logger.warning("Could not remove: " ~ e.msg);
+                        }
+                    }
+
+                    // Also remove initramfs from here - they belong in /boot
+                    foreach (entry; dirEntries(location, "initramfs*", SpanMode.shallow)) {
+                        Logger.info("Removing misplaced initramfs: " ~ entry.name);
+                        ui.printInfo("Removing initramfs from EFI: " ~ baseName(entry.name));
+                        try {
+                            remove(entry.name);
+                        } catch (Exception e) {
+                            Logger.warning("Could not remove: " ~ e.msg);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Logger.warning("Error cleaning misplaced kernels: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Configure rEFInd to scan correct paths
+     */
+    private void configureRefindScanPaths(ref SystemInfo sysInfo, string refindLocation) {
+        import std.file : readText, write, append;
+        import std.string : indexOf, replace;
+
+        if (refindLocation.length == 0) return;
+
+        try {
+            string refindConfPath = buildPath(refindLocation, "refind.conf");
+
+            if (!exists(refindConfPath)) {
+                // Create basic refind.conf
+                ui.printInfo("Creating refind.conf...");
+                string basicConf = "# rEFInd configuration\n" ~
+                    "timeout 10\n" ~
+                    "use_nvram false\n" ~
+                    "scanfor manual,external,optical,internal\n" ~
+                    "also_scan_dirs +,boot\n" ~
+                    "dont_scan_dirs /EFI/opensuse,/EFI/Microsoft\n" ~
+                    "scan_all_linux_kernels true\n\n";
+                write(refindConfPath, basicConf);
+            } else {
+                // Update existing configuration
+                string content = readText(refindConfPath);
+                bool modified = false;
+
+                // Ensure it scans /boot directory
+                if (content.indexOf("also_scan_dirs") == -1) {
+                    content ~= "\n# Added by debork - scan /boot for kernels\n";
+                    content ~= "also_scan_dirs +,boot\n";
+                    modified = true;
+                }
+
+                // Hide duplicate OpenSUSE entries
+                if (content.indexOf("dont_scan_dirs") == -1) {
+                    content ~= "dont_scan_dirs /EFI/opensuse\n";
+                    modified = true;
+                } else if (content.indexOf("/EFI/opensuse") == -1) {
+                    content = content.replace("dont_scan_dirs", "dont_scan_dirs /EFI/opensuse,");
+                    modified = true;
+                }
+
+                // Ensure Linux kernel scanning is enabled
+                if (content.indexOf("scan_all_linux_kernels") == -1) {
+                    content ~= "scan_all_linux_kernels true\n";
+                    modified = true;
+                }
+
+                if (modified) {
+                    // Backup and write
+                    string backupPath = refindConfPath ~ ".bak";
+                    copy(refindConfPath, backupPath);
+                    write(refindConfPath, content);
+                    ui.printInfo("Updated rEFInd configuration to scan /boot");
+                }
+            }
+        } catch (Exception e) {
+            Logger.error("Failed to configure rEFInd scan paths: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Clean up duplicate and incorrect rEFInd entries
+     */
+    private void cleanupRefindEntries(ref SystemInfo sysInfo) {
+        import std.file : dirEntries, SpanMode, remove;
+        import std.path : baseName;
+
+        try {
+            // Clean up duplicate kernel entries in /boot
+            ui.printInfo("Checking for duplicate boot entries...");
+
+            // Remove any vmlinuz files directly in /boot/efi (they shouldn't be there)
+            string efiBootDir = buildPath(sysInfo.efiDir, "EFI");
+            if (exists(efiBootDir)) {
+                foreach (entry; dirEntries(efiBootDir, "vmlinuz*", SpanMode.depth)) {
+                    if (!entry.isDir) {
+                        Logger.info("Removing misplaced kernel: " ~ entry.name);
+                        ui.printInfo("Removing misplaced kernel from EFI: " ~ baseName(entry.name));
+                        try {
+                            remove(entry.name);
+                        } catch (Exception e) {
+                            Logger.warning("Could not remove: " ~ e.msg);
+                        }
+                    }
+                }
+            }
+
+            // Check for and remove old/invalid refind_linux.conf files
+            string[] possibleLocations = [
+                buildPath(sysInfo.efiDir, "refind_linux.conf"),
+                buildPath(sysInfo.efiDir, "EFI/refind_linux.conf"),
+                buildPath(sysInfo.efiDir, "EFI/refind/refind_linux.conf"),
+                buildPath(sysInfo.mountPoint, "refind_linux.conf")
+            ];
+
+            foreach (location; possibleLocations) {
+                if (exists(location)) {
+                    Logger.info("Found misplaced refind_linux.conf at: " ~ location);
+                    ui.printInfo("Removing misplaced config: " ~ location);
+                    try {
+                        remove(location);
+                    } catch (Exception e) {
+                        Logger.warning("Could not remove: " ~ e.msg);
+                    }
+                }
+            }
+
+            // The only correct location for refind_linux.conf is /boot
+            Logger.info("Cleaned up rEFInd entries");
+
+        } catch (Exception e) {
+            Logger.warning("Error during rEFInd cleanup: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Verify refind_linux.conf has proper content
+     */
+    private void verifyRefindLinuxConf(ref SystemInfo sysInfo) {
+        import std.file : readText;
+
+        try {
+            string confPath = buildPath(sysInfo.bootDir, "refind_linux.conf");
+
+            if (!exists(confPath)) {
+                ui.printError("refind_linux.conf not found after generation!");
+                return;
+            }
+
+            string content = readText(confPath);
+
+            // Check for critical issues
+            bool hasIssues = false;
+
+            if (content.indexOf("root=") == -1) {
+                ui.printError("CRITICAL: No root= parameter in refind_linux.conf!");
+                hasIssues = true;
+            }
+
+            if (content.indexOf("root=\"\"") != -1 || content.indexOf("root= ") != -1) {
+                ui.printError("CRITICAL: Empty root= parameter detected!");
+                hasIssues = true;
+            }
+
+            if (content.indexOf("UUID=") == -1 && content.indexOf("PARTUUID=") == -1 &&
+                content.indexOf("/dev/") == -1) {
+                ui.printError("CRITICAL: No device specification found!");
+                hasIssues = true;
+            }
+
+            if (sysInfo.isBtrfs && content.indexOf("rootflags=subvol=") == -1) {
+                ui.printWarning("Warning: No btrfs subvolume specified!");
+                hasIssues = true;
+            }
+
+            // If there are issues, show the actual content for debugging
+            if (hasIssues) {
+                ui.printInfo("Current refind_linux.conf content:");
+                auto lines = content.split("\n");
+                foreach (i, line; lines) {
+                    if (line.length > 0) {
+                        ui.printInfo("  Line " ~ to!string(i+1) ~ ": " ~ line[0..min(line.length, 100)]);
+                    }
+                }
+
+                // Try to fix it one more time
+                ui.printInfo("Attempting to regenerate with forced parameters...");
+                forceRegenerateRefindLinuxConf(sysInfo);
+            } else {
+                ui.printSuccess("refind_linux.conf appears valid");
+
+                // Show the root parameter for confirmation
+                auto rootStart = content.indexOf("root=");
+                if (rootStart != -1) {
+                    auto rootEnd = content.indexOf(" ", rootStart);
+                    if (rootEnd == -1) rootEnd = content.indexOf("\"", rootStart);
+                    if (rootEnd != -1) {
+                        string rootParam = content[rootStart .. rootEnd];
+                        ui.printInfo("Using: " ~ rootParam);
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            Logger.error("Error verifying refind_linux.conf: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Force regenerate refind_linux.conf with explicit parameters
+     */
+    private void forceRegenerateRefindLinuxConf(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+        import std.file : write;
+
+        try {
+            // Get UUID by any means necessary
+            string uuid;
+            string device = sysInfo.device;
+
+            // Try multiple methods to get UUID
+            auto result = executeShell("blkid -s UUID -o value " ~ device ~ " 2>/dev/null");
+            if (result.status == 0 && result.output.strip().length > 0) {
+                uuid = result.output.strip();
+            } else {
+                result = executeShell("lsblk -no UUID " ~ device ~ " 2>/dev/null | head -n1");
+                if (result.status == 0 && result.output.strip().length > 0) {
+                    uuid = result.output.strip();
+                }
+            }
+
+            if (uuid.length == 0) {
+                // Last resort - use device path
+                ui.printWarning("Could not detect UUID, using device path directly");
+                uuid = "";
+            }
+
+            // Build the root parameter
+            string rootParam;
+            if (uuid.length > 0) {
+                rootParam = "root=UUID=" ~ uuid;
+            } else {
+                rootParam = "root=" ~ device;
+            }
+
+            // Add btrfs subvolume
+            if (sysInfo.isBtrfs) {
+                string subvol = sysInfo.btrfsInfo.rootSubvolume;
+                if (subvol.length == 0) subvol = "@";
+                if (subvol.startsWith("/")) subvol = subvol[1..$];
+                rootParam ~= " rootflags=subvol=" ~ subvol;
+            }
+
+            // Find initrd
+            string initrdParam = "";
+            foreach (kernel; sysInfo.kernels) {
+                if (kernel.initrdExists) {
+                    initrdParam = "initrd=" ~ baseName(kernel.initrd);
+                    break;
+                }
+            }
+
+            // Build the configuration
+            string content;
+            if (initrdParam.length > 0) {
+                content = format(
+                    "\"Boot with standard options\" \"%s %s rw quiet splash\"\n" ~
+                    "\"Boot to single-user mode\" \"%s %s rw single\"\n" ~
+                    "\"Boot with minimal options\" \"%s ro\"\n",
+                    rootParam, initrdParam,
+                    rootParam, initrdParam,
+                    rootParam
+                );
+            } else {
+                content = format(
+                    "\"Boot with standard options\" \"%s rw quiet splash\"\n" ~
+                    "\"Boot to single-user mode\" \"%s rw single\"\n" ~
+                    "\"Boot with minimal options\" \"%s ro\"\n",
+                    rootParam,
+                    rootParam,
+                    rootParam
+                );
+            }
+
+            // Write the file
+            string confPath = buildPath(sysInfo.bootDir, "refind_linux.conf");
+            write(confPath, content);
+
+            Logger.info("Force regenerated refind_linux.conf");
+            ui.printSuccess("Regenerated refind_linux.conf with explicit parameters");
+            ui.printInfo("Root parameter: " ~ rootParam);
+
+        } catch (Exception e) {
+            Logger.error("Failed to force regenerate: " ~ e.msg);
+            ui.printError("Could not regenerate configuration: " ~ e.msg);
         }
     }
 
@@ -859,8 +1490,14 @@ class RepairOperations {
 
             // Use UUID if available, otherwise fall back to device
             if (sysInfo.uuid.length > 0) {
-                rootParam = "root=UUID=" ~ sysInfo.uuid;
-                ui.printInfo("Using UUID for boot: " ~ sysInfo.uuid);
+                // Check if it's a PARTUUID
+                if (sysInfo.uuid.indexOf("-") == 8) {
+                    rootParam = "root=PARTUUID=" ~ sysInfo.uuid;
+                    ui.printInfo("Using PARTUUID for boot: " ~ sysInfo.uuid);
+                } else {
+                    rootParam = "root=UUID=" ~ sysInfo.uuid;
+                    ui.printInfo("Using UUID for boot: " ~ sysInfo.uuid);
+                }
             } else {
                 Logger.warning("No UUID available, using device path");
                 rootParam = "root=" ~ sysInfo.device;
@@ -1038,7 +1675,110 @@ class RepairOperations {
     }
 
     /**
-     * Fix EFI boot entries for CachyOS
+     * Create manual boot stanza in refind.conf
+     */
+    private void createRefindManualStanza(ref SystemInfo sysInfo) {
+        import std.file : readText, write, append;
+        import std.string : indexOf;
+
+        try {
+            // Find where rEFInd is actually installed
+            string refindLocation = detectRefindInstallation(sysInfo);
+            if (refindLocation.length == 0) {
+                Logger.warning("Cannot create manual stanza - rEFInd not found");
+                return;
+            }
+
+            string refindConfPath = buildPath(refindLocation, "refind.conf");
+
+            if (!exists(refindConfPath)) {
+                Logger.warning("refind.conf not found at: " ~ refindConfPath);
+                return;
+            }
+
+            // Read existing configuration
+            string content = readText(refindConfPath);
+
+            // Check if we already have a manual stanza for CachyOS/Arch
+            if (content.indexOf("menuentry \"CachyOS\"") != -1 ||
+                content.indexOf("menuentry \"Arch Linux\"") != -1) {
+                Logger.info("Manual stanza already exists in refind.conf");
+                return;
+            }
+
+            // Find the first kernel
+            KernelInfo primaryKernel;
+            bool foundKernel = false;
+            foreach (kernel; sysInfo.kernels) {
+                if (kernel.exists && kernel.initrdExists) {
+                    primaryKernel = kernel;
+                    foundKernel = true;
+                    break;
+                }
+            }
+
+            if (!foundKernel) {
+                Logger.warning("No valid kernel found for manual stanza");
+                return;
+            }
+
+            // Build root parameter
+            string rootParam;
+            if (sysInfo.uuid.length > 0) {
+                // Check if it's a PARTUUID
+                if (sysInfo.uuid.indexOf("-") == 8) {
+                    rootParam = "root=PARTUUID=" ~ sysInfo.uuid;
+                } else {
+                    rootParam = "root=UUID=" ~ sysInfo.uuid;
+                }
+            } else {
+                rootParam = "root=" ~ sysInfo.device;
+            }
+
+            // Add btrfs subvolume if needed
+            if (sysInfo.isBtrfs && sysInfo.btrfsInfo.rootSubvolume.length > 0) {
+                string subvol = sysInfo.btrfsInfo.rootSubvolume;
+                if (subvol.startsWith("/")) {
+                    subvol = subvol[1..$];
+                }
+                rootParam ~= " rootflags=subvol=" ~ subvol;
+            }
+
+            // Create manual stanza pointing to /boot
+            string stanza = "\n\n# Manual stanza added by debork\n";
+            stanza ~= "menuentry \"CachyOS Linux\" {\n";
+            stanza ~= "    icon     /EFI/refind/icons/os_arch.png\n";
+            stanza ~= "    volume   \"" ~ (sysInfo.uuid.length > 0 ? sysInfo.uuid : "boot") ~ "\"\n";
+            stanza ~= "    loader   /boot/vmlinuz-linux-cachyos\n";
+            stanza ~= "    initrd   /boot/initramfs-linux-cachyos.img\n";
+            stanza ~= "    options  \"" ~ rootParam ~ " rw quiet zswap.enabled=0 nowatchdog splash\"\n";
+            stanza ~= "    submenuentry \"Boot to single-user mode\" {\n";
+            stanza ~= "        options \"" ~ rootParam ~ " rw single\"\n";
+            stanza ~= "    }\n";
+            stanza ~= "    submenuentry \"Boot with minimal options\" {\n";
+            stanza ~= "        options \"" ~ rootParam ~ " ro\"\n";
+            stanza ~= "    }\n";
+            stanza ~= "}\n";
+
+            // Backup original
+            string backupPath = refindConfPath ~ ".bak";
+            copy(refindConfPath, backupPath);
+            Logger.info("Backed up refind.conf to: " ~ backupPath);
+
+            // Append stanza to configuration
+            append(refindConfPath, stanza);
+
+            Logger.info("Added manual boot stanza to refind.conf");
+            ui.printInfo("Created manual boot entry in rEFInd configuration");
+            ui.printInfo("Manual stanza uses: " ~ rootParam);
+
+        } catch (Exception e) {
+            Logger.warning("Could not create manual stanza: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Fix systemd-boot configuration
      */
     private bool fixEfiBootEntries(ref SystemInfo sysInfo) {
         try {
