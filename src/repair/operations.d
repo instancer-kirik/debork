@@ -913,28 +913,30 @@ class RepairOperations {
             string bootDevice = bootResult.output.strip();
 
             // Get the FAT UUID of the boot partition (this is what rEFInd uses for volume)
-            // Note: For FAT filesystems, we need the FAT UUID, not the filesystem UUID
-            auto uuidResult = executeShell("blkid -s UUID -o value " ~ bootDevice);
-            string bootVolumeId = uuidResult.status == 0 ? uuidResult.output.strip() : "";
+            // For FAT filesystems, we need the short UUID format (XXXX-XXXX), not a long UUID
+            string bootVolumeId = "";
 
-            // For FAT partitions, the UUID should be in format XXXX-XXXX
-            // If it's longer (like a regular UUID), we got the wrong one
-            if (bootVolumeId.length > 9) {
-                // Try getting the FAT UUID directly from blkid output
-                auto blkidResult = executeShell("blkid " ~ bootDevice ~ " | grep -oP 'UUID=\"\\K[^\"]+' | head -1");
-                if (blkidResult.status == 0) {
-                    string fatUuid = blkidResult.output.strip();
-                    // Check if this looks like a FAT UUID (XXXX-XXXX format)
-                    if (fatUuid.length <= 9 && fatUuid.indexOf("-") != -1) {
-                        bootVolumeId = fatUuid;
-                    }
+            // Get full blkid output and parse it
+            auto blkidResult = executeShell("blkid " ~ bootDevice);
+            if (blkidResult.status == 0) {
+                string blkidOutput = blkidResult.output;
+
+                // Look for UUID="XXXX-XXXX" pattern (FAT UUID format)
+                import std.regex : matchFirst, regex;
+                auto uuidMatch = matchFirst(blkidOutput, regex(`UUID="([0-9A-F]{4}-[0-9A-F]{4})"`));
+                if (uuidMatch) {
+                    bootVolumeId = uuidMatch[1];
+                    ui.printInfo("Detected FAT UUID: " ~ bootVolumeId);
                 }
             }
 
-            // If still no proper UUID, try label
-            if (bootVolumeId.length == 0 || bootVolumeId.length > 9) {
+            // If no UUID found, try label as fallback
+            if (bootVolumeId.length == 0) {
                 auto labelResult = executeShell("blkid -s LABEL -o value " ~ bootDevice);
                 bootVolumeId = labelResult.status == 0 ? labelResult.output.strip() : "";
+                if (bootVolumeId.length > 0) {
+                    ui.printInfo("Using volume label: " ~ bootVolumeId);
+                }
             }
 
             if (bootVolumeId.length == 0) {
@@ -981,14 +983,32 @@ class RepairOperations {
 
                 append(refindConfPath, manualEntry);
                 ui.printSuccess("Added manual CachyOS entry to rEFInd");
+            } else {
+                // Entry exists but might have wrong volume ID - fix it
+                ui.printInfo("Checking existing CachyOS entry...");
+
+                // Check if volume ID is wrong
+                import std.regex : replaceAll, regex;
+                string correctVolumePattern = "volume   " ~ bootVolumeId;
+
+                // Replace any wrong volume ID with the correct one
+                auto volumeRegex = regex(`(menuentry "CachyOS Linux"[^}]*volume\s+)[^\n]+`);
+                string newContent = replaceAll(refindContent, volumeRegex, "$1" ~ bootVolumeId);
+
+                if (newContent != refindContent) {
+                    // Backup and write corrected content
+                    copy(refindConfPath, refindConfPath ~ ".bak");
+                    write(refindConfPath, newContent);
+                    ui.printSuccess("Fixed volume ID in existing CachyOS entry to: " ~ bootVolumeId);
+                } else {
+                    ui.printInfo("Existing entry has correct volume ID");
+                }
 
                 // Also add exclusions to reduce duplicates
                 if (refindContent.indexOf("dont_scan_volumes") == -1) {
                     append(refindConfPath, "\n# Hide duplicate entries\n");
                     append(refindConfPath, "dont_scan_volumes " ~ bootVolumeId ~ "\n");
                 }
-            } else {
-                ui.printInfo("Manual CachyOS entry already exists");
             }
 
             ui.printSuccess("Dual-EFI rEFInd configuration completed");
