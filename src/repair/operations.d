@@ -9,6 +9,7 @@ import std.conv;
 import std.format;
 import std.regex;
 import std.array : join;
+import std.datetime : Clock;
 import debork.core.types;
 import debork.core.logger;
 import debork.system.chroot;
@@ -825,6 +826,11 @@ class RepairOperations {
             ui.printInfo("Cleaning up rEFInd entries...");
             cleanupRefindEntries(sysInfo);
 
+            // Ensure Btrfs driver is installed if needed
+            if (sysInfo.isBtrfs) {
+                ensureBtrfsDriver(sysInfo);
+            }
+
             // Always generate proper refind_linux.conf for btrfs systems
             ui.printInfo("Generating rEFInd configuration for btrfs system...");
             // Generate refind_linux.conf configuration
@@ -836,7 +842,7 @@ class RepairOperations {
             // Configure rEFInd to scan /boot for kernels
             configureRefindScanPaths(sysInfo, refindLocation);
 
-            // Also create manual boot stanza in refind.conf for reliability
+            // Also create or update manual boot stanza in refind.conf for reliability
             createRefindManualStanza(sysInfo);
 
             // Mount efivars if not already mounted (needed for efibootmgr)
@@ -976,8 +982,8 @@ class RepairOperations {
                 manualEntry ~= "menuentry \"CachyOS Linux\" {\n";
                 manualEntry ~= "    icon     /EFI/refind/icons/os_arch.png\n";
                 manualEntry ~= "    volume   " ~ bootVolumeId ~ "\n";
-                manualEntry ~= "    loader   /vmlinuz-linux-cachyos\n";
-                manualEntry ~= "    initrd   /initramfs-linux-cachyos.img\n";
+                manualEntry ~= "    loader   /boot/vmlinuz-linux-cachyos\n";
+                manualEntry ~= "    initrd   /boot/initramfs-linux-cachyos.img\n";
                 manualEntry ~= "    options  \"root=UUID=" ~ sysInfo.uuid ~ " rootflags=subvol=@ rw quiet splash\"\n";
                 manualEntry ~= "}\n";
 
@@ -1094,7 +1100,38 @@ class RepairOperations {
      * Detect where rEFInd is installed
      */
     private string detectRefindInstallation(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+
+        // First check all mounted EFI partitions
+        string[] efiMountPoints = [];
+
+        // Check common EFI mount points
+        if (exists("/mnt/EFI/refind")) {
+            efiMountPoints ~= "/mnt";
+        }
+        if (exists("/boot/efi/EFI")) {
+            efiMountPoints ~= "/boot/efi";
+        }
+        if (exists(buildPath(sysInfo.mountPoint, "boot/efi/EFI"))) {
+            efiMountPoints ~= buildPath(sysInfo.mountPoint, "boot/efi");
+        }
+
+        // Try to find Windows EFI partition if mounted
+        auto findResult = executeShell("find /mnt* -maxdepth 3 -name refind_x64.efi 2>/dev/null | head -1");
+        if (findResult.status == 0 && findResult.output.length > 0) {
+            string refindPath = findResult.output.strip();
+            if (exists(refindPath)) {
+                string location = dirName(refindPath);
+                Logger.info("Found rEFInd at: " ~ location);
+                ui.printInfo("rEFInd located at: " ~ location);
+                return location;
+            }
+        }
+
+        // Check standard locations in priority order
         string[] possibleLocations = [
+            "/mnt/EFI/refind",
+            "/mnt/EFI/EFI/refind",
             buildPath(sysInfo.efiDir, "EFI/refind"),
             buildPath(sysInfo.efiDir, "EFI/BOOT"),
             buildPath(sysInfo.efiDir, "EFI/boot"),
@@ -1736,8 +1773,14 @@ class RepairOperations {
 
             // Check if we already have a manual stanza for CachyOS/Arch
             if (content.indexOf("menuentry \"CachyOS\"") != -1 ||
+                content.indexOf("menuentry \"CachyOS Linux\"") != -1 ||
                 content.indexOf("menuentry \"Arch Linux\"") != -1) {
                 Logger.info("Manual stanza already exists in refind.conf");
+
+                // Always update existing entry if it has incorrect paths for Btrfs
+                if (sysInfo.isBtrfs && sysInfo.btrfsInfo.rootSubvolume.length > 0) {
+                    updateExistingRefindEntry(refindConfPath, sysInfo);
+                }
                 return;
             }
 
@@ -1783,9 +1826,28 @@ class RepairOperations {
             string stanza = "\n\n# Manual stanza added by debork\n";
             stanza ~= "menuentry \"CachyOS Linux\" {\n";
             stanza ~= "    icon     /EFI/refind/icons/os_arch.png\n";
-            stanza ~= "    volume   \"" ~ (sysInfo.uuid.length > 0 ? sysInfo.uuid : "boot") ~ "\"\n";
-            stanza ~= "    loader   /boot/vmlinuz-linux-cachyos\n";
-            stanza ~= "    initrd   /boot/initramfs-linux-cachyos.img\n";
+
+            // For Btrfs, use the UUID directly without quotes for volume
+            if (sysInfo.isBtrfs && sysInfo.uuid.length > 0) {
+                stanza ~= "    volume   " ~ sysInfo.uuid ~ "\n";
+                // For Btrfs with subvolumes, include the subvolume path
+                if (sysInfo.btrfsInfo.rootSubvolume.length > 0) {
+                    string subvolPath = sysInfo.btrfsInfo.rootSubvolume;
+                    if (!subvolPath.startsWith("/")) {
+                        subvolPath = "/" ~ subvolPath;
+                    }
+                    stanza ~= "    loader   " ~ subvolPath ~ "/boot/vmlinuz-linux-cachyos\n";
+                    stanza ~= "    initrd   " ~ subvolPath ~ "/boot/initramfs-linux-cachyos.img\n";
+                } else {
+                    stanza ~= "    loader   /boot/vmlinuz-linux-cachyos\n";
+                    stanza ~= "    initrd   /boot/initramfs-linux-cachyos.img\n";
+                }
+            } else {
+                stanza ~= "    volume   \"" ~ (sysInfo.uuid.length > 0 ? sysInfo.uuid : "boot") ~ "\"\n";
+                stanza ~= "    loader   /boot/vmlinuz-linux-cachyos\n";
+                stanza ~= "    initrd   /boot/initramfs-linux-cachyos.img\n";
+            }
+
             stanza ~= "    options  \"" ~ rootParam ~ " rw quiet zswap.enabled=0 nowatchdog splash\"\n";
             stanza ~= "    submenuentry \"Boot to single-user mode\" {\n";
             stanza ~= "        options \"" ~ rootParam ~ " rw single\"\n";
@@ -2263,6 +2325,131 @@ class RepairOperations {
             case BootLoader.GRUB:        return "GRUB";
             case BootLoader.REFIND:      return "rEFInd";
             case BootLoader.SYSTEMD_BOOT: return "systemd-boot";
+        }
+    }
+
+    /**
+     * Ensure Btrfs driver is installed for rEFInd
+     */
+    private void ensureBtrfsDriver(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+
+        try {
+            // Find where rEFInd is installed
+            string refindLocation = detectRefindInstallation(sysInfo);
+            if (refindLocation.length == 0) {
+                Logger.warning("Cannot install Btrfs driver - rEFInd not found");
+                return;
+            }
+
+            string driversDir = buildPath(refindLocation, "drivers_x64");
+            string btrfsDriverPath = buildPath(driversDir, "btrfs_x64.efi");
+
+            // Check if driver already exists
+            if (exists(btrfsDriverPath)) {
+                Logger.info("Btrfs driver already installed");
+                return;
+            }
+
+            // Create drivers directory if it doesn't exist
+            if (!exists(driversDir)) {
+                mkdirRecurse(driversDir);
+                Logger.info("Created rEFInd drivers directory");
+            }
+
+            // Look for Btrfs driver in the system
+            string[] possibleLocations = [
+                "/usr/share/refind/drivers_x64/btrfs_x64.efi",
+                buildPath(sysInfo.mountPoint, "usr/share/refind/drivers_x64/btrfs_x64.efi"),
+                "/usr/lib/refind/drivers_x64/btrfs_x64.efi",
+                buildPath(sysInfo.mountPoint, "usr/lib/refind/drivers_x64/btrfs_x64.efi")
+            ];
+
+            string sourceDriver = "";
+            foreach (location; possibleLocations) {
+                if (exists(location)) {
+                    sourceDriver = location;
+                    break;
+                }
+            }
+
+            if (sourceDriver.length > 0) {
+                copy(sourceDriver, btrfsDriverPath);
+                Logger.info("Installed Btrfs driver for rEFInd");
+                ui.printInfo("Installed Btrfs filesystem driver for rEFInd");
+            } else {
+                Logger.warning("Btrfs driver not found in system");
+                ui.printWarning("Could not find Btrfs driver - manual installation may be needed");
+            }
+
+        } catch (Exception e) {
+            Logger.warning("Could not install Btrfs driver: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Update existing rEFInd entry with correct Btrfs paths
+     */
+    private void updateExistingRefindEntry(string refindConfPath, ref SystemInfo sysInfo) {
+        import std.file : readText, write;
+        import std.regex : regex, replaceAll, matchFirst;
+
+        try {
+            string content = readText(refindConfPath);
+            string originalContent = content;
+
+            // For Btrfs with subvolumes, we need to prepend the subvolume path
+            if (sysInfo.btrfsInfo.rootSubvolume.length > 0) {
+                string subvolPath = sysInfo.btrfsInfo.rootSubvolume;
+                if (!subvolPath.startsWith("/")) {
+                    subvolPath = "/" ~ subvolPath;
+                }
+
+                // Find any CachyOS menuentry block and update it
+                auto menuRegex = regex(`(menuentry\s+"CachyOS[^"]*"\s*\{[^}]*\})`, "gms");
+                auto match = matchFirst(content, menuRegex);
+
+                if (!match.empty) {
+                    string menuBlock = match[1];
+                    string updatedBlock = menuBlock;
+
+                    // Update loader path if it doesn't have subvolume prefix already
+                    if (updatedBlock.indexOf(subvolPath ~ "/boot/vmlinuz") == -1) {
+                        auto loaderRegex = regex(`(loader\s+)(/boot/vmlinuz[-\w]+)`, "gm");
+                        updatedBlock = replaceAll(updatedBlock, loaderRegex, "$1" ~ subvolPath ~ "$2");
+                    }
+
+                    // Update initrd path if it doesn't have subvolume prefix already
+                    if (updatedBlock.indexOf(subvolPath ~ "/boot/initramfs") == -1) {
+                        auto initrdRegex = regex(`(initrd\s+)(/boot/initramfs[-\w]+\.img)`, "gm");
+                        updatedBlock = replaceAll(updatedBlock, initrdRegex, "$1" ~ subvolPath ~ "$2");
+                    }
+
+                    // Ensure volume uses UUID without quotes for Btrfs
+                    auto volumeRegex = regex(`(volume\s+)"?([0-9a-fA-F-]+)"?`, "gm");
+                    updatedBlock = replaceAll(updatedBlock, volumeRegex, "$1$2");
+
+                    // Replace the original block with the updated one
+                    if (menuBlock != updatedBlock) {
+                        content = content.replace(menuBlock, updatedBlock);
+                    }
+                }
+
+                // If content changed, write it back
+                if (content != originalContent) {
+                    // Backup original
+                    string backupPath = refindConfPath ~ ".bak-" ~ to!string(Clock.currTime.toUnixTime());
+                    copy(refindConfPath, backupPath);
+
+                    // Write updated content
+                    write(refindConfPath, content);
+                    Logger.info("Updated existing rEFInd entry with Btrfs subvolume paths");
+                    ui.printInfo("Updated rEFInd configuration for Btrfs filesystem");
+                }
+            }
+
+        } catch (Exception e) {
+            Logger.warning("Could not update existing rEFInd entry: " ~ e.msg);
         }
     }
 }
