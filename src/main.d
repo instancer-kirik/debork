@@ -520,6 +520,7 @@ class DeborkApp {
         MenuOption[] advancedMenu = [
             MenuOption("Repair Filesystem", "Check and repair filesystem errors", true),
             MenuOption("Fix File Permissions", "Repair common permission issues", true),
+            MenuOption("Install GRUB Bootloader", "Install GRUB for Btrfs/complex setups", true),
             MenuOption("Remount with Different Options", "Change mount options", true),
             MenuOption("View Mount Information", "Show detailed mount info", true),
             MenuOption("Test Chroot Environment", "Verify chroot functionality", true),
@@ -550,7 +551,19 @@ class DeborkApp {
                     ui.waitForKey();
                     break;
 
-                case 2: // Remount Options
+                case 2: // Install GRUB
+                    ui.printHeader();
+                    ui.printInfo("Installing GRUB bootloader...");
+                    if (repairOps.installGrubBootloader(sysInfo)) {
+                        ui.printStatus("✓ GRUB installed successfully");
+                        ui.printInfo("GRUB will appear as a boot option in rEFInd");
+                    } else {
+                        ui.printError("GRUB installation failed");
+                    }
+                    ui.waitForKey();
+                    break;
+
+                case 3: // Remount Options
                     string options = ui.promptInput("Enter mount options (e.g., rw,noatime)");
                     if (options.length > 0) {
                         if (MountManager.remountWithOptions(sysInfo, options)) {
@@ -562,13 +575,13 @@ class DeborkApp {
                     ui.waitForKey();
                     break;
 
-                case 3: // Mount Info
+                case 4: // Mount Info
                     string[] mountInfo = MountManager.getMountInfo(sysInfo);
                     ui.printList(mountInfo);
                     ui.waitForKey();
                     break;
 
-                case 4: // Test Chroot
+                case 5: // Test Chroot
                     if (ChrootManager.testChroot(sysInfo)) {
                         ui.printStatus("✓ Chroot test passed");
                     } else {
@@ -577,7 +590,7 @@ class DeborkApp {
                     ui.waitForKey();
                     break;
 
-                case 5: // Back
+                case 6: // Back
                 case -1:
                     return;
 

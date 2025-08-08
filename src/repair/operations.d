@@ -734,6 +734,14 @@ class RepairOperations {
     }
 
     /**
+     * Install GRUB bootloader (public method for menu)
+     */
+    bool installGrubBootloader(ref SystemInfo sysInfo) {
+        Logger.info("Installing GRUB bootloader from menu");
+        return installGrubForBtrfs(sysInfo);
+    }
+
+    /**
      * Fix bootloader configuration
      */
     bool fixBootloader(ref SystemInfo sysInfo) {
@@ -808,6 +816,18 @@ class RepairOperations {
             if (isDualEfiSetup) {
                 ui.printInfo("Detected dual-EFI partition setup");
                 return fixDualEfiRefind(sysInfo);
+            }
+
+            // For Btrfs systems, offer to install GRUB as it handles subvolumes better
+            if (sysInfo.isBtrfs) {
+                ui.printInfo("Btrfs filesystem detected - GRUB handles this better than direct kernel loading");
+                string response = ui.promptInput("Install GRUB for better Btrfs support? (recommended) [Y/n]");
+                if (response.toLower() != "n" && response.toLower() != "no") {
+                    if (installGrubForBtrfs(sysInfo)) {
+                        ui.printSuccess("GRUB installed - rEFInd will chainload it");
+                        return true;
+                    }
+                }
             }
 
             // First, detect where rEFInd is actually installed
@@ -1924,6 +1944,169 @@ class RepairOperations {
         } catch (Exception e) {
             Logger.error("Exception fixing EFI boot entries: " ~ e.msg);
             return false;
+        }
+    }
+
+    /**
+     * Install GRUB for CachyOS/Arch systems
+     */
+    private bool installGrubForBtrfs(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+
+        Logger.info("Installing GRUB for Btrfs system");
+        ui.printInfo("Installing GRUB bootloader for better Btrfs support...");
+
+        try {
+            // Check if GRUB is installed in the system
+            if (!exists(buildPath(sysInfo.mountPoint, "usr/bin/grub-install"))) {
+                ui.printInfo("Installing GRUB package...");
+                auto process = ChrootManager.executeChrootDirect(sysInfo, ["pacman", "-S", "--noconfirm", "grub", "efibootmgr"]);
+                auto exitCode = wait(process);
+
+                if (exitCode != 0) {
+                    ui.printError("Failed to install GRUB package");
+                    return false;
+                }
+            }
+
+            // Find Windows EFI partition (where rEFInd is)
+            string windowsEfiPath = "";
+            if (exists("/mnt/EFI/refind")) {
+                windowsEfiPath = "/mnt";
+            } else if (exists("/mnt/debork/boot/efi")) {
+                windowsEfiPath = buildPath(sysInfo.mountPoint, "boot/efi");
+            }
+
+            if (windowsEfiPath.length == 0) {
+                ui.printError("Could not find EFI partition");
+                return false;
+            }
+
+            // Mount Windows EFI to /boot/efi in chroot if needed
+            string chrootEfiPath = buildPath(sysInfo.mountPoint, "boot/efi");
+            if (!exists(chrootEfiPath)) {
+                mkdirRecurse(chrootEfiPath);
+            }
+
+            // Check if already mounted
+            auto mountCheck = executeShell("mountpoint -q " ~ chrootEfiPath);
+            if (mountCheck.status != 0) {
+                // Find the Windows EFI partition device
+                auto efiDevice = executeShell("df " ~ windowsEfiPath ~ " | tail -1 | awk '{print $1}'");
+                if (efiDevice.status == 0) {
+                    string device = efiDevice.output.strip();
+                    auto mountResult = executeShell("mount " ~ device ~ " " ~ chrootEfiPath);
+                    if (mountResult.status != 0) {
+                        ui.printWarning("Could not mount EFI partition to chroot");
+                    }
+                }
+            }
+
+            // Mount efivars if not already mounted
+            string efivarPath = buildPath(sysInfo.mountPoint, "sys/firmware/efi/efivars");
+            if (exists("/sys/firmware/efi/efivars") && exists(efivarPath)) {
+                auto efivarCheck = executeShell("mountpoint -q " ~ efivarPath);
+                if (efivarCheck.status != 0) {
+                    auto mountEfivars = executeShell("mount --bind /sys/firmware/efi/efivars " ~ efivarPath);
+                    if (mountEfivars.status == 0) {
+                        Logger.info("Mounted efivars for GRUB installation");
+                    }
+                }
+            }
+
+            // Install GRUB to EFI with removable flag for better compatibility
+            ui.printInfo("Installing GRUB to EFI partition...");
+            auto process = ChrootManager.executeChrootDirect(sysInfo, [
+                "grub-install",
+                "--target=x86_64-efi",
+                "--efi-directory=/boot/efi",
+                "--bootloader-id=CachyOS",
+                "--removable",
+                "--recheck"
+            ]);
+            auto exitCode = wait(process);
+
+            if (exitCode != 0) {
+                // Try without removable flag if it failed
+                ui.printInfo("Retrying GRUB installation without removable flag...");
+                process = ChrootManager.executeChrootDirect(sysInfo, [
+                    "grub-install",
+                    "--target=x86_64-efi",
+                    "--efi-directory=/boot/efi",
+                    "--bootloader-id=CachyOS",
+                    "--no-nvram",
+                    "--recheck"
+                ]);
+                exitCode = wait(process);
+
+                if (exitCode != 0) {
+                    ui.printError("GRUB installation failed");
+                    return false;
+                }
+            }
+
+            // Generate GRUB configuration
+            ui.printInfo("Generating GRUB configuration...");
+            process = ChrootManager.executeChrootDirect(sysInfo, ["grub-mkconfig", "-o", "/boot/grub/grub.cfg"]);
+            exitCode = wait(process);
+
+            if (exitCode != 0) {
+                ui.printWarning("GRUB configuration generation had issues");
+            }
+
+            ui.printSuccess("GRUB installed successfully");
+            ui.printInfo("rEFInd should now detect 'CachyOS' GRUB entry");
+
+            // Create a manual rEFInd entry for GRUB if needed
+            createRefindGrubEntry(sysInfo);
+
+            return true;
+
+        } catch (Exception e) {
+            Logger.error("Failed to install GRUB: " ~ e.msg);
+            ui.printError("GRUB installation failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Create rEFInd entry for GRUB
+     */
+    private void createRefindGrubEntry(ref SystemInfo sysInfo) {
+        try {
+            // Find rEFInd configuration
+            string refindConfPath = "";
+            if (exists("/mnt/EFI/refind/refind.conf")) {
+                refindConfPath = "/mnt/EFI/refind/refind.conf";
+            } else if (exists(buildPath(sysInfo.mountPoint, "boot/efi/EFI/refind/refind.conf"))) {
+                refindConfPath = buildPath(sysInfo.mountPoint, "boot/efi/EFI/refind/refind.conf");
+            }
+
+            if (refindConfPath.length == 0) {
+                Logger.warning("rEFInd configuration not found");
+                return;
+            }
+
+            // Check if GRUB entry already exists
+            string content = readText(refindConfPath);
+            if (content.indexOf("menuentry \"CachyOS GRUB\"") != -1) {
+                Logger.info("GRUB entry already exists in rEFInd");
+                return;
+            }
+
+            // Add GRUB entry
+            string grubEntry = "\n\n# GRUB entry for CachyOS\n";
+            grubEntry ~= "menuentry \"CachyOS GRUB\" {\n";
+            grubEntry ~= "    icon     /EFI/refind/icons/os_arch.png\n";
+            grubEntry ~= "    loader   /EFI/CachyOS/grubx64.efi\n";
+            grubEntry ~= "    options  \"\"\n";
+            grubEntry ~= "}\n";
+
+            append(refindConfPath, grubEntry);
+            ui.printInfo("Added GRUB entry to rEFInd configuration");
+
+        } catch (Exception e) {
+            Logger.warning("Could not create rEFInd GRUB entry: " ~ e.msg);
         }
     }
 
