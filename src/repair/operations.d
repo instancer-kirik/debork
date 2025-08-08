@@ -912,12 +912,27 @@ class RepairOperations {
 
             string bootDevice = bootResult.output.strip();
 
-            // Get the UUID/label of the boot partition
+            // Get the FAT UUID of the boot partition (this is what rEFInd uses for volume)
+            // Note: For FAT filesystems, we need the FAT UUID, not the filesystem UUID
             auto uuidResult = executeShell("blkid -s UUID -o value " ~ bootDevice);
             string bootVolumeId = uuidResult.status == 0 ? uuidResult.output.strip() : "";
 
-            // If no UUID, try label
-            if (bootVolumeId.length == 0) {
+            // For FAT partitions, the UUID should be in format XXXX-XXXX
+            // If it's longer (like a regular UUID), we got the wrong one
+            if (bootVolumeId.length > 9) {
+                // Try getting the FAT UUID directly from blkid output
+                auto blkidResult = executeShell("blkid " ~ bootDevice ~ " | grep -oP 'UUID=\"\\K[^\"]+' | head -1");
+                if (blkidResult.status == 0) {
+                    string fatUuid = blkidResult.output.strip();
+                    // Check if this looks like a FAT UUID (XXXX-XXXX format)
+                    if (fatUuid.length <= 9 && fatUuid.indexOf("-") != -1) {
+                        bootVolumeId = fatUuid;
+                    }
+                }
+            }
+
+            // If still no proper UUID, try label
+            if (bootVolumeId.length == 0 || bootVolumeId.length > 9) {
                 auto labelResult = executeShell("blkid -s LABEL -o value " ~ bootDevice);
                 bootVolumeId = labelResult.status == 0 ? labelResult.output.strip() : "";
             }
