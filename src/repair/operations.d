@@ -168,6 +168,10 @@ class RepairOperations {
                 ensureMkinitcpioConfig(sysInfo);
                 // Also verify UUID is properly detected
                 verifyAndFixDeviceDetection(sysInfo);
+                // Verify initramfs will be generated with correct modules
+                verifyInitramfsModules(sysInfo);
+                // Run comprehensive boot diagnostics
+                runBootDiagnostics(sysInfo);
             }
 
             string[][] commands = getInitramfsCommands(sysInfo.packageManager);
@@ -286,27 +290,28 @@ class RepairOperations {
                     string modulesLine = content[modulesIdx .. modulesEnd + 1];
                     string newModulesLine = modulesLine;
 
+                    // Get required modules for early loading
+                    string[] requiredModules;
+
                     // Add btrfs module if using btrfs
-                    if (sysInfo.isBtrfs && modulesLine.indexOf("btrfs") == -1) {
-                        if (modulesLine == "MODULES=()") {
-                            newModulesLine = "MODULES=(btrfs)";
-                        } else {
-                            newModulesLine = newModulesLine.replace(")", " btrfs)");
-                        }
-                        Logger.info("Adding btrfs module to mkinitcpio.conf");
-                        modified = true;
+                    if (sysInfo.isBtrfs) {
+                        requiredModules ~= "btrfs";
+                        requiredModules ~= "crc32c";  // Required by btrfs
                     }
 
-                    // Detect and add storage controller modules
+                    // Add storage controller modules for early loading
                     string[] storageModules = detectStorageModules();
-                    foreach (mod; storageModules) {
-                        if (modulesLine.indexOf(mod) == -1) {
+                    requiredModules ~= storageModules;
+
+                    // Add each required module if not present
+                    foreach (mod; requiredModules) {
+                        if (mod.length > 0 && modulesLine.indexOf(mod) == -1) {
                             if (newModulesLine == "MODULES=()") {
                                 newModulesLine = "MODULES=(" ~ mod ~ ")";
                             } else {
                                 newModulesLine = newModulesLine.replace(")", " " ~ mod ~ ")");
                             }
-                            Logger.info("Adding storage module to mkinitcpio.conf: " ~ mod);
+                            Logger.info("Adding module to mkinitcpio.conf: " ~ mod);
                             modified = true;
                         }
                     }
@@ -461,6 +466,154 @@ class RepairOperations {
         }
 
         return modules;
+    }
+
+    /**
+     * Verify initramfs will include necessary modules
+     */
+    private void verifyInitramfsModules(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+
+        try {
+            // Check if we can determine the root filesystem module requirements
+            auto fsResult = executeShell("lsmod | grep -E 'btrfs|ext4|xfs'");
+            if (fsResult.status == 0 && fsResult.output.length > 0) {
+                Logger.info("Currently loaded filesystem modules: " ~ fsResult.output.strip());
+            }
+
+            // For btrfs, ensure dependencies are available
+            if (sysInfo.isBtrfs) {
+                // Check if btrfs module is available
+                auto btrfsCheck = executeShell("modinfo btrfs 2>/dev/null | grep -q filename");
+                if (btrfsCheck.status != 0) {
+                    ui.printWarning("btrfs module not found - kernel may not have btrfs support!");
+                    Logger.error("btrfs kernel module not available");
+                }
+
+                // Ensure critical btrfs dependencies
+                string configPath = buildPath(sysInfo.mountPoint, "etc", "mkinitcpio.conf");
+                if (exists(configPath)) {
+                    auto checkHooks = executeShell("grep '^HOOKS=' " ~ configPath ~ " | grep -q btrfs");
+                    if (checkHooks.status != 0) {
+                        ui.printWarning("btrfs hook missing from mkinitcpio.conf - fixing...");
+                        ensureMkinitcpioConfig(sysInfo);
+                    }
+                }
+            }
+
+            // Verify the kernel command line will be correct
+            string refindConf = buildPath(sysInfo.mountPoint, "boot", "refind_linux.conf");
+            if (exists(refindConf)) {
+                import std.file : readText;
+                string content = readText(refindConf);
+
+                // Check if root= parameter exists
+                if (content.indexOf("root=") == -1) {
+                    Logger.error("refind_linux.conf missing root= parameter!");
+                    ui.printError("Boot configuration missing root device - regenerating...");
+                    generateRefindLinuxConf(sysInfo);
+                } else if (content.indexOf("root=\"\"") != -1 || content.indexOf("root= ") != -1) {
+                    Logger.error("refind_linux.conf has empty root= parameter!");
+                    ui.printError("Boot configuration has empty root device - regenerating...");
+                    generateRefindLinuxConf(sysInfo);
+                } else {
+                    Logger.info("refind_linux.conf appears to have valid root= parameter");
+                }
+            }
+
+        } catch (Exception e) {
+            Logger.warning("Could not verify initramfs modules: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Run comprehensive boot diagnostics
+     */
+    private void runBootDiagnostics(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+        import std.file : readText;
+
+        ui.printInfo("Running boot diagnostics...");
+        Logger.info("=== Boot Diagnostics Start ===");
+
+        // 1. Check device and UUID
+        ui.printInfo("Device Information:");
+        ui.printInfo("  Device: " ~ sysInfo.device);
+        ui.printInfo("  UUID: " ~ (sysInfo.uuid.length > 0 ? sysInfo.uuid : "NOT DETECTED"));
+        ui.printInfo("  Filesystem: " ~ sysInfo.fstype);
+
+        if (sysInfo.uuid.length == 0) {
+            ui.printError("CRITICAL: No UUID detected - boot will fail!");
+
+            // Try to detect it one more time
+            auto blkidResult = executeShell("blkid " ~ sysInfo.device);
+            if (blkidResult.status == 0) {
+                ui.printInfo("blkid output: " ~ blkidResult.output.strip());
+            }
+        }
+
+        // 2. Check refind_linux.conf
+        string refindConfPath = buildPath(sysInfo.mountPoint, "boot", "refind_linux.conf");
+        if (exists(refindConfPath)) {
+            try {
+                string content = readText(refindConfPath);
+                ui.printInfo("refind_linux.conf content:");
+                auto lines = content.split("\n");
+                foreach (line; lines[0 .. min(3, lines.length)]) {
+                    ui.printInfo("  " ~ line);
+                }
+
+                // Check for empty root parameter
+                if (content.indexOf("root= ") != -1 || content.indexOf("root=\"\"") != -1) {
+                    ui.printError("CRITICAL: Empty root parameter detected!");
+                }
+                if (content.indexOf("root=") == -1) {
+                    ui.printError("CRITICAL: No root parameter found!");
+                }
+            } catch (Exception e) {
+                ui.printError("Could not read refind_linux.conf: " ~ e.msg);
+            }
+        } else {
+            ui.printError("refind_linux.conf not found at: " ~ refindConfPath);
+        }
+
+        // 3. Check mkinitcpio.conf
+        string mkinitcpioPath = buildPath(sysInfo.mountPoint, "etc", "mkinitcpio.conf");
+        if (exists(mkinitcpioPath)) {
+            auto hooksResult = executeShell("grep '^HOOKS=' " ~ mkinitcpioPath);
+            if (hooksResult.status == 0) {
+                ui.printInfo("mkinitcpio HOOKS: " ~ hooksResult.output.strip());
+
+                // Check for critical hooks
+                if (hooksResult.output.indexOf("block") == -1) {
+                    ui.printError("CRITICAL: 'block' hook missing!");
+                }
+                if (sysInfo.isBtrfs && hooksResult.output.indexOf("btrfs") == -1) {
+                    ui.printError("CRITICAL: 'btrfs' hook missing for btrfs filesystem!");
+                }
+            }
+
+            auto modulesResult = executeShell("grep '^MODULES=' " ~ mkinitcpioPath);
+            if (modulesResult.status == 0) {
+                ui.printInfo("mkinitcpio MODULES: " ~ modulesResult.output.strip());
+            }
+        }
+
+        // 4. Check kernel and initramfs files
+        ui.printInfo("Boot files:");
+        foreach (kernel; sysInfo.kernels) {
+            ui.printInfo("  Kernel: " ~ kernel.path ~ " [" ~ (kernel.exists ? "EXISTS" : "MISSING") ~ "]");
+            ui.printInfo("  Initrd: " ~ kernel.initrd ~ " [" ~ (kernel.initrdExists ? "EXISTS" : "MISSING") ~ "]");
+        }
+
+        // 5. Check if running in EFI mode
+        if (exists("/sys/firmware/efi")) {
+            ui.printInfo("System is running in UEFI mode");
+        } else {
+            ui.printWarning("System is running in BIOS/Legacy mode or EFI not accessible");
+        }
+
+        Logger.info("=== Boot Diagnostics End ===");
     }
 
     /**
@@ -652,21 +805,53 @@ class RepairOperations {
      */
     private bool generateRefindLinuxConf(ref SystemInfo sysInfo) {
         try {
+            // Try using mkrlconf first if available
+            if (exists(buildPath(sysInfo.mountPoint, "usr/bin/mkrlconf"))) {
+                ui.printInfo("Using mkrlconf to generate refind_linux.conf...");
+                auto mkrlconfResult = ChrootManager.executeChrootDirect(sysInfo, ["mkrlconf", "--force"]);
+                auto exitCode = wait(mkrlconfResult);
+
+                if (exitCode == 0) {
+                    Logger.info("Successfully generated refind_linux.conf with mkrlconf");
+                    ui.printSuccess("Generated refind_linux.conf using mkrlconf");
+
+                    // Verify and fix the generated file if needed
+                    fixRefindLinuxConf(sysInfo);
+                    return true;
+                } else {
+                    Logger.warning("mkrlconf failed, falling back to manual generation");
+                }
+            }
+
             string bootPath = sysInfo.bootDir;
             string refindConfPath = buildPath(bootPath, "refind_linux.conf");
 
             // Detect the actual UUID if not already set
             if (sysInfo.uuid.length == 0) {
                 try {
+                    // Try multiple methods to get UUID
                     auto uuidResult = execute(["blkid", "-s", "UUID", "-o", "value", sysInfo.device]);
-                    if (uuidResult.status == 0) {
+                    if (uuidResult.status == 0 && uuidResult.output.strip().length > 0) {
                         sysInfo.uuid = uuidResult.output.strip();
-                        Logger.info("Detected UUID: " ~ sysInfo.uuid);
+                        Logger.info("Detected UUID via blkid: " ~ sysInfo.uuid);
+                    } else {
+                        // Try lsblk as fallback
+                        auto lsblkResult = execute(["lsblk", "-no", "UUID", sysInfo.device]);
+                        if (lsblkResult.status == 0 && lsblkResult.output.strip().length > 0) {
+                            sysInfo.uuid = lsblkResult.output.strip().split("\n")[0];
+                            Logger.info("Detected UUID via lsblk: " ~ sysInfo.uuid);
+                        }
                     }
                 } catch (Exception e) {
                     Logger.error("Failed to detect UUID: " ~ e.msg);
-                    ui.printWarning("Could not detect UUID, using device path instead");
+                    ui.printWarning("Could not detect UUID, will use device path");
                 }
+            }
+
+            // Verify the device exists
+            if (!exists(sysInfo.device)) {
+                Logger.error("Device does not exist: " ~ sysInfo.device);
+                ui.printError("Warning: Root device not found: " ~ sysInfo.device);
             }
 
             // Generate configuration content
@@ -675,9 +860,11 @@ class RepairOperations {
             // Use UUID if available, otherwise fall back to device
             if (sysInfo.uuid.length > 0) {
                 rootParam = "root=UUID=" ~ sysInfo.uuid;
+                ui.printInfo("Using UUID for boot: " ~ sysInfo.uuid);
             } else {
                 Logger.warning("No UUID available, using device path");
                 rootParam = "root=" ~ sysInfo.device;
+                ui.printWarning("Using device path instead of UUID: " ~ sysInfo.device);
             }
 
             // Add btrfs subvolume if needed
@@ -696,15 +883,40 @@ class RepairOperations {
             }
 
             // Add common CachyOS boot parameters
-            string commonParams = "quiet zswap.enabled=0 nowatchdog splash rw";
+            // Important: Include initrd explicitly for some rEFInd versions
+            string initrdParam = "";
+            foreach (kernel; sysInfo.kernels) {
+                if (kernel.initrdExists) {
+                    // Use relative path from /boot
+                    string initrdName = baseName(kernel.initrd);
+                    initrdParam = "initrd=" ~ initrdName;
+                    break;
+                }
+            }
 
+            string commonParams = "rw quiet zswap.enabled=0 nowatchdog splash";
+            if (initrdParam.length > 0) {
+                commonParams = initrdParam ~ " " ~ commonParams;
+            }
+
+            // Ensure we have proper root device specification
+            if (rootParam.length == 0) {
+                Logger.error("Root parameter is empty!");
+                ui.printError("Failed to determine root device parameter");
+                rootParam = "root=" ~ sysInfo.device;  // Fallback to device path
+            }
+
+            // Log the parameters for debugging
+            Logger.info("Boot parameters: " ~ rootParam ~ " " ~ commonParams);
+
+            // Format with proper quoting
             string content = format(
-                "\"Boot with standard options\"  \"%s %s\"\n" ~
-                "\"Boot to single-user mode\"    \"%s %s single\"\n" ~
-                "\"Boot with minimal options\"   \"ro root=%s%s\"\n",
+                "\"Boot with standard options\"  %s %s\n" ~
+                "\"Boot to single-user mode\"    %s %s single\n" ~
+                "\"Boot with minimal options\"   %s ro\n",
                 rootParam, commonParams,
                 rootParam, commonParams,
-                sysInfo.device, sysInfo.isBtrfs ? " rootflags=subvol=@" : ""
+                rootParam
             );
 
             // Backup existing configuration if it exists
@@ -717,8 +929,13 @@ class RepairOperations {
             // Write configuration file
             write(refindConfPath, content);
             Logger.info("Generated rEFInd configuration: " ~ refindConfPath);
+            Logger.info("Configuration content:\n" ~ content);
             ui.printSuccess("Generated rEFInd configuration with btrfs support");
             ui.printInfo("Configuration written to: " ~ refindConfPath);
+
+            // Display the actual content for verification
+            ui.printInfo("Boot parameters configured:");
+            ui.printInfo("  " ~ rootParam ~ (sysInfo.isBtrfs ? " (with btrfs subvolume)" : ""));
 
             // Also fix the EFI bootloader entries if needed
             fixEfiBootEntries(sysInfo);
@@ -728,6 +945,95 @@ class RepairOperations {
         } catch (Exception e) {
             Logger.error("Exception generating rEFInd configuration: " ~ e.msg);
             return false;
+        }
+    }
+
+    /**
+     * Fix refind_linux.conf if it has issues
+     */
+    private void fixRefindLinuxConf(ref SystemInfo sysInfo) {
+        import std.file : readText, write;
+        import std.string : replace, indexOf;
+
+        try {
+            string confPath = buildPath(sysInfo.bootDir, "refind_linux.conf");
+            if (!exists(confPath)) {
+                return;
+            }
+
+            string content = readText(confPath);
+            bool modified = false;
+
+            // Check if root= parameter is empty or missing
+            if (content.indexOf("root= ") != -1 || content.indexOf("root=\"\"") != -1) {
+                // Root parameter is empty, need to fix it
+                string rootParam;
+                if (sysInfo.uuid.length > 0) {
+                    rootParam = "root=UUID=" ~ sysInfo.uuid;
+                } else {
+                    rootParam = "root=" ~ sysInfo.device;
+                }
+
+                // Add btrfs subvolume if needed
+                if (sysInfo.isBtrfs && sysInfo.btrfsInfo.rootSubvolume.length > 0) {
+                    string subvol = sysInfo.btrfsInfo.rootSubvolume;
+                    if (subvol.startsWith("/")) {
+                        subvol = subvol[1..$];
+                    }
+                    rootParam ~= " rootflags=subvol=" ~ subvol;
+                }
+
+                // Replace empty root with proper one
+                content = content.replace("root= ", rootParam ~ " ");
+                content = content.replace("root=\"\"", rootParam);
+                modified = true;
+
+                Logger.info("Fixed empty root parameter in refind_linux.conf");
+                ui.printInfo("Fixed boot configuration with proper root device");
+            }
+
+            // Ensure initrd is specified if missing
+            if (content.indexOf("initrd=") == -1) {
+                foreach (kernel; sysInfo.kernels) {
+                    if (kernel.initrdExists) {
+                        string initrdName = baseName(kernel.initrd);
+                        // Add initrd parameter to each line
+                        auto lines = content.split("\n");
+                        string newContent;
+                        foreach (line; lines) {
+                            if (line.length > 0 && line.indexOf("\"") != -1) {
+                                // Insert initrd before other parameters
+                                auto firstQuote = line.indexOf("\"");
+                                auto secondQuote = line.indexOf("\"", firstQuote + 1);
+                                if (secondQuote != -1) {
+                                    auto thirdQuote = line.indexOf("\"", secondQuote + 1);
+                                    if (thirdQuote != -1) {
+                                        string params = line[secondQuote + 1 .. thirdQuote];
+                                        params = "initrd=" ~ initrdName ~ " " ~ params;
+                                        line = line[0 .. secondQuote + 1] ~ params ~ line[thirdQuote .. $];
+                                    }
+                                }
+                            }
+                            newContent ~= line ~ "\n";
+                        }
+                        content = newContent;
+                        modified = true;
+                        Logger.info("Added initrd parameter to refind_linux.conf");
+                        break;
+                    }
+                }
+            }
+
+            if (modified) {
+                // Backup and write new content
+                string backupPath = confPath ~ ".bak";
+                copy(confPath, backupPath);
+                write(confPath, content);
+                Logger.info("Updated refind_linux.conf with fixes");
+            }
+
+        } catch (Exception e) {
+            Logger.warning("Could not fix refind_linux.conf: " ~ e.msg);
         }
     }
 
