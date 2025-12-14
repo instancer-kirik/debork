@@ -43,6 +43,14 @@ enum FilesystemType {
     REISERFS
 }
 
+// Graphics hardware vendors
+enum GraphicsVendor {
+    Unknown,
+    Intel,
+    AMD,
+    NVIDIA
+}
+
 // Log levels
 enum LogLevel {
     DEBUG,
@@ -118,11 +126,23 @@ struct SystemInfo {
     bool isValidated;                   // Passed validation checks
 }
 
+// Graphics hardware information
+struct GraphicsInfo {
+    GraphicsVendor vendor = GraphicsVendor.Unknown;
+    string description;
+    bool useModesetting = false;    // Whether to use modesetting driver
+    bool needsProprietary = false;  // Whether needs proprietary drivers
+}
+
 // Configuration for repair operations
 struct RepairConfig {
     bool updatePackages = true;
     bool regenerateInitramfs = true;
     bool fixBootloader = true;
+    bool fixGraphicsDrivers = true;
+    bool validateShellConfigs = true;
+    bool validateNetworkConfig = true;
+    bool removePlymouthFromGrub = false;
     bool skipConfirmation = false;
     bool verboseOutput = false;
 }

@@ -41,7 +41,7 @@ class RepairOperations {
         // Step 1: Update packages
         if (config.updatePackages) {
             ui.printInfo("Step 1/3: Updating packages...");
-            if (updatePackages(sysInfo)) {
+            if (updatePackagesUniversal(sysInfo)) {
                 result.completedSteps ~= "Package update";
                 ui.printStatus("✓ Packages updated successfully");
             } else {
@@ -50,20 +50,43 @@ class RepairOperations {
             }
         }
 
-        // Step 2: Regenerate initramfs
+        // Step 1.5: Fix graphics drivers if needed
+        if (config.fixGraphicsDrivers) {
+            ui.printInfo("Step 1.5/4: Checking graphics drivers...");
+            if (fixGraphicsDrivers(sysInfo)) {
+                result.completedSteps ~= "Graphics drivers fixed";
+                ui.printStatus("✓ Graphics drivers configured successfully");
+            } else {
+                result.warnings ~= "Graphics driver configuration may need manual attention";
+            }
+        }
+
+        // Step 2: Remove Plymouth from GRUB if requested
+        if (config.removePlymouthFromGrub) {
+            ui.printInfo("Step 2/4: Removing Plymouth from GRUB...");
+            if (removePlymouthFromGrub(sysInfo)) {
+                result.completedSteps ~= "Plymouth removed from GRUB";
+                ui.printStatus("✓ Plymouth removed from GRUB successfully");
+            } else {
+                result.warnings ~= "Could not remove Plymouth from GRUB";
+            }
+        }
+
+        // Step 3: Regenerate initramfs
         if (config.regenerateInitramfs) {
-            ui.printInfo("Step 2/3: Regenerating initramfs...");
+            ui.printInfo("Step 3/4: Regenerating initramfs...");
             if (regenerateInitramfs(sysInfo)) {
                 result.completedSteps ~= "Initramfs regeneration";
                 ui.printStatus("✓ Initramfs regenerated successfully");
             } else {
                 result.errors ~= "Initramfs regeneration failed";
+                result.warnings ~= "System may not boot properly";
             }
         }
 
-        // Step 3: Fix bootloader
+        // Step 4: Fix bootloader
         if (config.fixBootloader) {
-            ui.printInfo("Step 3/3: Fixing bootloader...");
+            ui.printInfo("Step 4/4: Fixing bootloader...");
             if (fixBootloader(sysInfo)) {
                 result.completedSteps ~= "Bootloader repair";
                 ui.printStatus("✓ Bootloader fixed successfully");
@@ -1430,6 +1453,2101 @@ class RepairOperations {
 
         } catch (Exception e) {
             Logger.error("Error verifying refind_linux.conf: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Fix graphics drivers configuration
+     */
+    bool fixGraphicsDrivers(ref SystemInfo sysInfo) {
+        Logger.info("Starting comprehensive graphics driver fix");
+        ui.printInfo("Analyzing graphics hardware and configuration...");
+
+        try {
+            // Detect graphics hardware
+            GraphicsInfo gfxInfo = detectGraphicsHardware(sysInfo);
+
+            if (gfxInfo.vendor == GraphicsVendor.Unknown) {
+                Logger.warning("Could not detect graphics hardware");
+                return false;
+            }
+
+            ui.printInfo("Detected: " ~ gfxInfo.description);
+
+            // Remove problematic xf86-video drivers
+            bool driversRemoved = removeProblematicDrivers(sysInfo, gfxInfo);
+
+            // Check and fix X11 configuration
+            bool x11Fixed = fixX11Configuration(sysInfo, gfxInfo);
+
+            // Fix font configuration
+            bool fontsFixed = fixFontConfiguration(sysInfo);
+
+            // Fix display manager configuration
+            bool displayManagerFixed = fixDisplayManagerConfiguration(sysInfo);
+
+            // Check Plymouth configuration
+            bool plymouthFixed = checkPlymouthConfiguration(sysInfo);
+
+            // Ensure proper Mesa drivers are installed
+            bool mesaFixed = ensureMesaDrivers(sysInfo, gfxInfo);
+
+            // Check if 'here' universal package manager is available
+            bool hereAvailable = checkHereAvailability(sysInfo);
+
+            // Check and fix shell configurations
+            bool shellFixed = validateShellConfigurations(sysInfo);
+
+            // Check and fix network connectivity
+            bool networkFixed = validateNetworkConfiguration(sysInfo);
+
+            bool overallSuccess = x11Fixed && fontsFixed && mesaFixed;
+            if (driversRemoved) ui.printStatus("✓ Removed problematic xf86-video drivers");
+            if (displayManagerFixed) ui.printStatus("✓ Display manager configuration updated");
+            if (plymouthFixed) ui.printStatus("✓ Plymouth configuration checked");
+            if (shellFixed) ui.printStatus("✓ Shell configurations validated");
+            if (networkFixed) ui.printStatus("✓ Network configuration validated");
+            if (!hereAvailable) ui.printWarning("! 'here' universal package manager not found - using distribution-specific commands");
+
+            return overallSuccess;
+
+        } catch (Exception e) {
+            Logger.error("Graphics driver fix failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Detect graphics hardware information
+     */
+    private GraphicsInfo detectGraphicsHardware(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+        import std.algorithm : canFind, startsWith;
+
+        GraphicsInfo info;
+
+        try {
+            // Use lspci to detect graphics hardware in chroot
+            auto result = ChrootManager.executeInChroot(sysInfo, ["lspci", "-nn"]);
+
+            if (result.status == 0) {
+                foreach (line; result.output.split('\n')) {
+                    if (line.canFind("VGA") || line.canFind("Display") || line.canFind("3D")) {
+                        info.description = line.strip();
+
+                        if (line.canFind("Intel")) {
+                            info.vendor = GraphicsVendor.Intel;
+                            // Detect specific Intel generations
+                            if (line.canFind("Meteor Lake") || line.canFind("Raptor Lake") ||
+                                line.canFind("Alder Lake") || line.canFind("Tiger Lake")) {
+                                info.useModesetting = true;
+                            }
+                        } else if (line.canFind("AMD") || line.canFind("ATI")) {
+                            info.vendor = GraphicsVendor.AMD;
+                            info.useModesetting = true;
+                        } else if (line.canFind("NVIDIA")) {
+                            info.vendor = GraphicsVendor.NVIDIA;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            Logger.info("Graphics detection: " ~ info.description);
+            return info;
+
+        } catch (Exception e) {
+            Logger.error("Failed to detect graphics hardware: " ~ e.msg);
+            return info;
+        }
+    }
+
+    /**
+     * Fix X11 configuration for detected graphics hardware
+     */
+    private bool fixX11Configuration(ref SystemInfo sysInfo, GraphicsInfo gfxInfo) {
+        import std.file : write, mkdirRecurse, exists, readText;
+        import std.path : buildPath, dirName;
+
+        string xorgConfDir = buildPath(sysInfo.mountPoint, "etc", "X11", "xorg.conf.d");
+
+        try {
+            // Ensure xorg.conf.d directory exists
+            if (!exists(xorgConfDir)) {
+                mkdirRecurse(xorgConfDir);
+            }
+
+            string configFile = buildPath(xorgConfDir, "20-graphics.conf");
+            string configContent;
+
+            switch (gfxInfo.vendor) {
+                case GraphicsVendor.Intel:
+                    if (gfxInfo.useModesetting) {
+                        // Modern Intel graphics - use modesetting driver
+                        configContent = `Section "Device"
+    Identifier "Intel Graphics"
+    Driver "modesetting"
+    Option "AccelMethod" "glamor"
+    Option "DRI" "3"
+EndSection`;
+                        ui.printInfo("Configuring modern Intel graphics with modesetting driver");
+                    } else {
+                        // Older Intel graphics - use intel driver if available
+                        configContent = `Section "Device"
+    Identifier "Intel Graphics"
+    Driver "intel"
+    Option "TearFree" "true"
+    Option "AccelMethod" "sna"
+    Option "DRI" "3"
+EndSection`;
+                        ui.printInfo("Configuring older Intel graphics with intel driver");
+                    }
+                    break;
+
+                case GraphicsVendor.AMD:
+                    // AMD graphics - use modesetting driver
+                    configContent = `Section "Device"
+    Identifier "AMD Graphics"
+    Driver "modesetting"
+    Option "AccelMethod" "glamor"
+    Option "DRI" "3"
+    Option "TearFree" "true"
+EndSection`;
+                    ui.printInfo("Configuring AMD graphics with modesetting driver");
+                    break;
+
+                case GraphicsVendor.NVIDIA:
+                    // NVIDIA - check if proprietary drivers are installed
+                    configContent = `Section "Device"
+    Identifier "NVIDIA Graphics"
+    Driver "nvidia"
+    Option "NoLogo" "true"
+EndSection`;
+                    ui.printInfo("Configuring NVIDIA graphics (proprietary driver)");
+                    break;
+
+                default:
+                    // Generic fallback
+                    configContent = `Section "Device"
+    Identifier "Generic Graphics"
+    Driver "modesetting"
+    Option "AccelMethod" "glamor"
+    Option "DRI" "3"
+EndSection`;
+                    ui.printInfo("Configuring generic graphics with modesetting driver");
+                    break;
+            }
+
+            // Remove conflicting configurations
+            string[] conflictingFiles = ["20-intel.conf", "20-amd.conf", "20-nvidia.conf"];
+            foreach (file; conflictingFiles) {
+                string conflictPath = buildPath(xorgConfDir, file);
+                if (exists(conflictPath)) {
+                    Logger.info("Removing conflicting X11 config: " ~ file);
+                    remove(conflictPath);
+                }
+            }
+
+            // Write new configuration
+            write(configFile, configContent);
+            Logger.info("Created X11 configuration: " ~ configFile);
+
+            return true;
+
+        } catch (Exception e) {
+            Logger.error("Failed to fix X11 configuration: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Fix font configuration to prevent X11 font errors
+     */
+    private bool fixFontConfiguration(ref SystemInfo sysInfo) {
+        import std.process : executeShell;
+        import std.file : exists;
+        import std.path : buildPath;
+
+        try {
+            string[] fontDirs = [
+                buildPath(sysInfo.mountPoint, "usr", "share", "fonts", "misc"),
+                buildPath(sysInfo.mountPoint, "usr", "share", "fonts", "TTF"),
+                buildPath(sysInfo.mountPoint, "usr", "share", "fonts", "OTF"),
+                buildPath(sysInfo.mountPoint, "usr", "share", "fonts", "Type1")
+            ];
+
+            bool anyFixed = false;
+
+            foreach (fontDir; fontDirs) {
+                if (exists(fontDir)) {
+                    Logger.info("Generating fonts.dir for: " ~ fontDir);
+                    auto result = executeShell("mkfontdir " ~ fontDir);
+                    if (result.status == 0) {
+                        anyFixed = true;
+                    }
+                }
+            }
+
+            // Update font cache in chroot
+            auto result = ChrootManager.executeInChroot(sysInfo, ["fc-cache", "-fv"]);
+            if (result.status == 0) {
+                anyFixed = true;
+                Logger.info("Font cache updated successfully");
+            }
+
+            return anyFixed;
+
+        } catch (Exception e) {
+            Logger.error("Failed to fix font configuration: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Ensure proper Mesa drivers are installed
+     */
+    private bool ensureMesaDrivers(ref SystemInfo sysInfo, GraphicsInfo gfxInfo) {
+        try {
+            string[] packagesToCheck;
+
+            switch (gfxInfo.vendor) {
+                case GraphicsVendor.Intel:
+                    packagesToCheck = ["mesa", "libva-intel-driver", "intel-media-driver"];
+                    break;
+                case GraphicsVendor.AMD:
+                    packagesToCheck = ["mesa", "libva-mesa-driver", "mesa-vdpau"];
+                    break;
+                default:
+                    packagesToCheck = ["mesa"];
+                    break;
+            }
+
+            bool allPresent = true;
+            foreach (pkg; packagesToCheck) {
+                auto result = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Q", pkg]);
+                if (result.status != 0) {
+                    Logger.warning("Mesa driver package not installed: " ~ pkg);
+                    allPresent = false;
+                }
+            }
+
+            if (allPresent) {
+                ui.printStatus("✓ Mesa drivers are properly installed");
+            } else {
+                ui.printWarning("! Some Mesa driver packages may be missing");
+                ui.printInfo("  Consider installing: " ~ packagesToCheck.join(" "));
+            }
+
+            return true; // Don't fail repair for this
+
+        } catch (Exception e) {
+            Logger.error("Failed to check Mesa drivers: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Remove problematic xf86-video drivers that conflict with modesetting
+     */
+    private bool removeProblematicDrivers(ref SystemInfo sysInfo, GraphicsInfo gfxInfo) {
+        try {
+            string[] problematicDrivers;
+
+            switch (gfxInfo.vendor) {
+                case GraphicsVendor.Intel:
+                    // Modern Intel graphics should use modesetting, not xf86-video-intel
+                    if (gfxInfo.useModesetting) {
+                        problematicDrivers = ["xf86-video-intel"];
+                    }
+                    break;
+                case GraphicsVendor.AMD:
+                    // Modern AMD graphics should use modesetting, not legacy drivers
+                    problematicDrivers = ["xf86-video-ati", "xf86-video-radeon"];
+                    break;
+                default:
+                    break;
+            }
+
+            bool anyRemoved = false;
+            foreach (driver; problematicDrivers) {
+                auto checkResult = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Q", driver]);
+                if (checkResult.status == 0) {
+                    Logger.info("Found problematic driver: " ~ driver);
+                    ui.printWarning("! Removing problematic driver: " ~ driver);
+
+                    auto removeResult = ChrootManager.executeInChroot(sysInfo,
+                        ["pacman", "-Rns", "--noconfirm", driver]);
+
+                    if (removeResult.status == 0) {
+                        Logger.info("Successfully removed: " ~ driver);
+                        anyRemoved = true;
+                    } else {
+                        Logger.warning("Failed to remove " ~ driver ~ ": " ~ removeResult.output);
+                    }
+                }
+            }
+
+            return anyRemoved;
+
+        } catch (Exception e) {
+            Logger.error("Failed to remove problematic drivers: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Fix display manager configuration (LightDM, SDDM, GDM)
+     */
+    private bool fixDisplayManagerConfiguration(ref SystemInfo sysInfo) {
+        ui.printInfo("Detecting and configuring display manager...");
+
+        // Detect which display manager is installed/enabled
+        string activeDisplayManager = detectDisplayManager(sysInfo);
+
+        if (activeDisplayManager.empty) {
+            ui.printWarning("! No display manager detected");
+            return offerDisplayManagerInstallation(sysInfo);
+        }
+
+        ui.printInfo("Detected display manager: " ~ activeDisplayManager);
+
+        switch (activeDisplayManager) {
+            case "lightdm":
+                return fixLightDMConfiguration(sysInfo);
+            case "sddm":
+                return fixSDDMConfiguration(sysInfo);
+            case "gdm":
+                return fixGDMConfiguration(sysInfo);
+            default:
+                ui.printWarning("! Unsupported display manager: " ~ activeDisplayManager);
+                return false;
+        }
+    }
+
+    /**
+     * Detect which display manager is active
+     */
+    private string detectDisplayManager(ref SystemInfo sysInfo) {
+        string[] displayManagers = ["sddm", "lightdm", "gdm"];
+
+        foreach (dm; displayManagers) {
+            // Check if service is enabled
+            auto result = ChrootManager.executeInChroot(sysInfo, ["systemctl", "is-enabled", dm ~ ".service"]);
+            if (result.status == 0 && result.output.strip() == "enabled") {
+                return dm;
+            }
+        }
+
+        // Fall back to checking if packages are installed
+        foreach (dm; displayManagers) {
+            auto result = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Q", dm]);
+            if (result.status == 0) {
+                return dm;
+            }
+        }
+
+        return "";
+    }
+
+    /**
+     * Offer to install a display manager
+     */
+    private bool offerDisplayManagerInstallation(ref SystemInfo sysInfo) {
+        ui.printInfo("No display manager found. Would you like to install one?");
+
+        MenuOption[] dmOptions = [
+            MenuOption("SDDM", "Modern Qt-based display manager (recommended for KDE/modern systems)", true),
+            MenuOption("LightDM", "Lightweight display manager (good for XFCE/lightweight DEs)", true),
+            MenuOption("GDM", "GNOME display manager (recommended for GNOME)", true),
+            MenuOption("Skip", "Skip display manager installation", true)
+        ];
+
+        int choice = ui.showMenu(dmOptions);
+        string selectedDM = "";
+
+        switch (choice) {
+            case 0: selectedDM = "sddm"; break;
+            case 1: selectedDM = "lightdm lightdm-gtk-greeter"; break;
+            case 2: selectedDM = "gdm"; break;
+            default: return false;
+        }
+
+        ui.printInfo("Installing " ~ selectedDM ~ "...");
+        string[] packages = selectedDM.split();
+        bool installSuccess = true;
+
+        foreach (pkg; packages) {
+            if (!installPackageUniversal(sysInfo, pkg)) {
+                installSuccess = false;
+                break;
+            }
+        }
+
+        auto result = CommandResult();
+        result.status = installSuccess ? 0 : 1;
+
+        if (result.status == 0) {
+            // Enable the service
+            string serviceName = selectedDM.split()[0] ~ ".service";
+            ChrootManager.executeInChroot(sysInfo, ["systemctl", "enable", serviceName]);
+            ui.printStatus("✓ " ~ selectedDM.split()[0] ~ " installed and enabled");
+            return true;
+        } else {
+            ui.printError("Failed to install " ~ selectedDM);
+            return false;
+        }
+    }
+
+    /**
+     * Fix GDM configuration
+     */
+    private bool fixGDMConfiguration(ref SystemInfo sysInfo) {
+        try {
+            string gdmConf = buildPath(sysInfo.mountPoint, "etc", "gdm", "custom.conf");
+
+            if (!exists(gdmConf)) {
+                Logger.warning("GDM configuration not found: " ~ gdmConf);
+                return false;
+            }
+
+            string content = readText(gdmConf);
+            string originalContent = content;
+            bool modified = false;
+
+            // Ensure Wayland is disabled if having X11 issues
+            if (content.indexOf("WaylandEnable") == -1) {
+                auto daemonSection = content.indexOf("[daemon]");
+                if (daemonSection == -1) {
+                    content ~= "\n[daemon]\nWaylandEnable=false\n";
+                } else {
+                    auto nextSection = content.indexOf("[", daemonSection + 1);
+                    string insertion = "WaylandEnable=false\n";
+
+                    if (nextSection != -1) {
+                        content = content[0..nextSection] ~ insertion ~ content[nextSection..$];
+                    } else {
+                        content ~= insertion;
+                    }
+                }
+                modified = true;
+                Logger.info("Disabled Wayland in GDM for X11 compatibility");
+            }
+
+            if (modified) {
+                write(gdmConf, content);
+                Logger.info("Updated GDM configuration");
+                return true;
+            }
+
+            return false;
+
+        } catch (Exception e) {
+            Logger.error("Failed to fix GDM configuration: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Fix SDDM configuration
+     */
+    private bool fixSDDMConfiguration(ref SystemInfo sysInfo) {
+        import std.file : write, mkdirRecurse;
+
+        try {
+            string sddmConfDir = buildPath(sysInfo.mountPoint, "etc", "sddm.conf.d");
+            string configFile = buildPath(sddmConfDir, "debork-fix.conf");
+
+            if (!exists(sddmConfDir)) {
+                mkdirRecurse(sddmConfDir);
+            }
+
+            string sddmConfig = `[General]
+# Debork graphics fix - ensure proper session detection
+DisplayServer=x11
+
+[Theme]
+# Use default theme to avoid theme-related crashes
+Current=
+
+[X11]
+# Ensure proper X11 server arguments
+ServerArguments=-nolisten tcp
+
+[Wayland]
+# Wayland session configuration
+SessionDir=/usr/share/wayland-sessions
+
+[Users]
+# Allow all users
+MaximumUid=65000
+MinimumUid=1000
+`;
+
+            write(configFile, sddmConfig);
+            Logger.info("Created SDDM configuration: " ~ configFile);
+            ui.printStatus("✓ SDDM configuration updated");
+            return true;
+
+        } catch (Exception e) {
+            Logger.error("Failed to configure SDDM: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Fix LightDM configuration
+     */
+    private bool fixLightDMConfiguration(ref SystemInfo sysInfo) {
+        import std.file : exists, readText, write;
+        import std.string : indexOf, replace;
+
+        try {
+            string lightdmConf = buildPath(sysInfo.mountPoint, "etc", "lightdm", "lightdm.conf");
+
+            if (!exists(lightdmConf)) {
+                Logger.warning("LightDM configuration not found: " ~ lightdmConf);
+                return false;
+            }
+
+            string content = readText(lightdmConf);
+            string originalContent = content;
+            bool modified = false;
+
+            // Ensure greeter-session is properly set
+            if (content.indexOf("greeter-session=") == -1 &&
+                content.indexOf("greeter-session =") == -1) {
+
+                // Add greeter session configuration
+                auto seatDefault = content.indexOf("[Seat:*]");
+                if (seatDefault != -1) {
+                    auto nextSection = content.indexOf("[", seatDefault + 1);
+                    string insertion = "\ngreeter-session=lightdm-gtk-greeter\n";
+
+                    if (nextSection != -1) {
+                        content = content[0..nextSection] ~ insertion ~ content[nextSection..$];
+                    } else {
+                        content ~= insertion;
+                    }
+                    modified = true;
+                    Logger.info("Added greeter-session configuration");
+                }
+            }
+
+            // Fix any session timeout issues
+            if (content.indexOf("greeter-timeout=") == -1) {
+                auto seatDefault = content.indexOf("[Seat:*]");
+                if (seatDefault != -1) {
+                    auto nextSection = content.indexOf("[", seatDefault + 1);
+                    string insertion = "greeter-timeout=30\n";
+
+                    if (nextSection != -1) {
+                        content = content[0..nextSection] ~ insertion ~ content[nextSection..$];
+                    } else {
+                        content ~= insertion;
+                    }
+                    modified = true;
+                    Logger.info("Added greeter timeout configuration");
+                }
+            }
+
+            if (modified) {
+                write(lightdmConf, content);
+                Logger.info("Updated LightDM configuration");
+                return true;
+            }
+
+            return false;
+
+        } catch (Exception e) {
+            Logger.error("Failed to fix LightDM greeter configuration: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Check Plymouth configuration for conflicts
+     */
+    private bool checkPlymouthConfiguration(ref SystemInfo sysInfo) {
+        try {
+            // Check if Plymouth is installed
+            auto plymouthCheck = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Q", "plymouth"]);
+
+            if (plymouthCheck.status != 0) {
+                Logger.info("Plymouth not installed - no conflicts");
+                return true;
+            }
+
+            ui.printInfo("Plymouth detected - checking configuration...");
+
+            // Check current theme
+            auto themeCheck = ChrootManager.executeInChroot(sysInfo, ["plymouth-set-default-theme"]);
+            if (themeCheck.status == 0) {
+                Logger.info("Plymouth theme: " ~ themeCheck.output.strip());
+            }
+
+            // Check if plymouth is in initramfs hooks
+            string mkinitcpioConf = buildPath(sysInfo.mountPoint, "etc", "mkinitcpio.conf");
+            if (exists(mkinitcpioConf)) {
+                string content = readText(mkinitcpioConf);
+                if (content.indexOf("plymouth") != -1) {
+                    ui.printInfo("Plymouth is properly integrated in initramfs");
+                } else {
+                    ui.printWarning("Plymouth may not be properly integrated in initramfs");
+                    ui.printInfo("Consider adding 'plymouth' to HOOKS in /etc/mkinitcpio.conf");
+                }
+            }
+
+            // Plymouth itself rarely causes X11 issues, but log for reference
+            Logger.info("Plymouth configuration checked");
+            return true;
+
+        } catch (Exception e) {
+            Logger.error("Failed to check Plymouth configuration: " ~ e.msg);
+            return false;
+        }
+    }
+
+
+    /**
+     * Diagnose graphics and display issues
+     */
+    void diagnoseGraphicsIssues(ref SystemInfo sysInfo) {
+        ui.printHeader();
+        ui.printInfo("Diagnosing graphics and display configuration...");
+
+        try {
+            // Detect graphics hardware
+            GraphicsInfo gfxInfo = detectGraphicsHardware(sysInfo);
+
+            ui.printInfo("=== Graphics Hardware ===");
+            if (gfxInfo.vendor != GraphicsVendor.Unknown) {
+                ui.printStatus("✓ " ~ gfxInfo.description);
+            } else {
+                ui.printWarning("! Could not detect graphics hardware");
+            }
+
+            // Check X11 configuration
+            ui.printInfo("\n=== X11 Configuration ===");
+            diagnoseX11Config(sysInfo, gfxInfo);
+
+            // Check problematic drivers
+            ui.printInfo("\n=== Driver Conflicts ===");
+            diagnoseDriverConflicts(sysInfo, gfxInfo);
+
+            // Check fonts
+            ui.printInfo("\n=== Font Configuration ===");
+            diagnoseFonts(sysInfo);
+
+            // Check LightDM
+            ui.printInfo("\n=== Display Manager ===");
+            diagnoseLightDM(sysInfo);
+
+            // Check Plymouth
+            ui.printInfo("\n=== Boot Splash ===");
+            diagnosePlymouth(sysInfo);
+
+            // Check Mesa
+            ui.printInfo("\n=== Mesa Drivers ===");
+            diagnoseMesa(sysInfo, gfxInfo);
+
+        } catch (Exception e) {
+            Logger.error("Graphics diagnostics failed: " ~ e.msg);
+            ui.printError("Diagnostics failed: " ~ e.msg);
+        }
+
+        ui.printInfo("\nPress any key to continue...");
+        ui.waitForKey();
+    }
+
+    /**
+     * Diagnose X11 configuration issues
+     */
+    private void diagnoseX11Config(ref SystemInfo sysInfo, GraphicsInfo gfxInfo) {
+        import std.file : exists, readText, dirEntries, SpanMode;
+
+        string xorgConfDir = buildPath(sysInfo.mountPoint, "etc", "X11", "xorg.conf.d");
+
+        if (!exists(xorgConfDir)) {
+            ui.printWarning("! No X11 configuration directory found");
+            return;
+        }
+
+        bool foundGraphicsConfig = false;
+        try {
+            foreach (entry; dirEntries(xorgConfDir, SpanMode.shallow)) {
+                if (entry.name.endsWith(".conf")) {
+                    string content = readText(entry.name);
+                    if (content.indexOf("Device") != -1 && content.indexOf("Driver") != -1) {
+                        foundGraphicsConfig = true;
+                        string filename = baseName(entry.name);
+                        ui.printInfo("  Found config: " ~ filename);
+
+                        // Check for problematic drivers
+                        if (content.indexOf(`Driver "intel"`) != -1 && gfxInfo.useModesetting) {
+                            ui.printWarning("  ! Using legacy intel driver for modern hardware");
+                        } else if (content.indexOf(`Driver "modesetting"`) != -1) {
+                            ui.printStatus("  ✓ Using modern modesetting driver");
+                        }
+                    }
+                }
+            }
+
+            if (!foundGraphicsConfig) {
+                ui.printWarning("! No graphics driver configuration found");
+            }
+
+        } catch (Exception e) {
+            ui.printError("Could not read X11 configuration: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Diagnose driver conflicts
+     */
+    private void diagnoseDriverConflicts(ref SystemInfo sysInfo, GraphicsInfo gfxInfo) {
+        string[] conflictingPackages;
+
+        switch (gfxInfo.vendor) {
+            case GraphicsVendor.Intel:
+                if (gfxInfo.useModesetting) {
+                    conflictingPackages = ["xf86-video-intel"];
+                }
+                break;
+            case GraphicsVendor.AMD:
+                conflictingPackages = ["xf86-video-ati", "xf86-video-radeon"];
+                break;
+            default:
+                break;
+        }
+
+        bool foundConflicts = false;
+        foreach (pkg; conflictingPackages) {
+            auto result = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Q", pkg]);
+            if (result.status == 0) {
+                ui.printWarning("! Conflicting driver installed: " ~ pkg);
+                foundConflicts = true;
+            }
+        }
+
+        if (!foundConflicts) {
+            ui.printStatus("✓ No conflicting drivers detected");
+        }
+    }
+
+    /**
+     * Diagnose font configuration
+     */
+    private void diagnoseFonts(ref SystemInfo sysInfo) {
+        string[] fontDirs = [
+            buildPath(sysInfo.mountPoint, "usr", "share", "fonts", "misc"),
+            buildPath(sysInfo.mountPoint, "usr", "share", "fonts", "TTF"),
+            buildPath(sysInfo.mountPoint, "usr", "share", "fonts", "OTF")
+        ];
+
+        bool allGood = true;
+        foreach (fontDir; fontDirs) {
+            if (exists(fontDir)) {
+                string fontsDir = buildPath(fontDir, "fonts.dir");
+                if (exists(fontsDir)) {
+                    ui.printStatus("✓ " ~ baseName(fontDir) ~ " has fonts.dir");
+                } else {
+                    ui.printWarning("! " ~ baseName(fontDir) ~ " missing fonts.dir");
+                    allGood = false;
+                }
+            }
+        }
+
+        if (allGood) {
+            ui.printStatus("✓ Font configuration looks good");
+        }
+    }
+
+    /**
+     * Diagnose LightDM configuration
+     */
+    private void diagnoseLightDM(ref SystemInfo sysInfo) {
+        string lightdmConf = buildPath(sysInfo.mountPoint, "etc", "lightdm", "lightdm.conf");
+
+        if (!exists(lightdmConf)) {
+            ui.printWarning("! LightDM configuration not found");
+            return;
+        }
+
+        try {
+            string content = readText(lightdmConf);
+
+            if (content.indexOf("greeter-session") != -1) {
+                ui.printStatus("✓ Greeter session configured");
+            } else {
+                ui.printWarning("! No greeter session configured");
+            }
+
+            // Check if greeter packages are installed
+            string[] greeters = ["lightdm-gtk-greeter", "lightdm-slick-greeter"];
+            bool foundGreeter = false;
+            foreach (greeter; greeters) {
+                auto result = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Q", greeter]);
+                if (result.status == 0) {
+                    ui.printStatus("✓ " ~ greeter ~ " installed");
+                    foundGreeter = true;
+                }
+            }
+
+            if (!foundGreeter) {
+                ui.printWarning("! No LightDM greeter packages found");
+            }
+
+        } catch (Exception e) {
+            ui.printError("Could not read LightDM config: " ~ e.msg);
+        }
+    }
+
+    /**
+     * Diagnose Plymouth configuration
+     */
+    private void diagnosePlymouth(ref SystemInfo sysInfo) {
+        auto plymouthCheck = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Q", "plymouth"]);
+
+        if (plymouthCheck.status != 0) {
+            ui.printInfo("  Plymouth not installed");
+            return;
+        }
+
+        ui.printStatus("✓ Plymouth installed");
+
+        auto themeCheck = ChrootManager.executeInChroot(sysInfo, ["plymouth-set-default-theme"]);
+        if (themeCheck.status == 0) {
+            ui.printInfo("  Theme: " ~ themeCheck.output.strip());
+        }
+    }
+
+    /**
+     * Diagnose Mesa drivers
+     */
+    private void diagnoseMesa(ref SystemInfo sysInfo, GraphicsInfo gfxInfo) {
+        string[] expectedPackages = ["mesa"];
+
+        switch (gfxInfo.vendor) {
+            case GraphicsVendor.Intel:
+                expectedPackages ~= ["libva-intel-driver", "intel-media-driver"];
+                break;
+            case GraphicsVendor.AMD:
+                expectedPackages ~= ["libva-mesa-driver", "mesa-vdpau"];
+                break;
+            default:
+                break;
+        }
+
+        foreach (pkg; expectedPackages) {
+            auto result = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Q", pkg]);
+            if (result.status == 0) {
+                ui.printStatus("✓ " ~ pkg ~ " installed");
+            } else {
+                ui.printWarning("! " ~ pkg ~ " not installed");
+            }
+        }
+    }
+
+    /**
+     * Validate and fix shell configurations that can silently brick systems
+     */
+    bool validateShellConfigurations(ref SystemInfo sysInfo) {
+        ui.printInfo("Checking shell configurations for syntax errors...");
+
+        try {
+            bool anyFixed = false;
+            string[] users = getUserList(sysInfo);
+
+            // Check system-wide shell configs
+            anyFixed |= validateSystemShellConfigs(sysInfo);
+
+            // Check user shell configs
+            foreach (user; users) {
+                anyFixed |= validateUserShellConfigs(sysInfo, user);
+            }
+
+            return anyFixed;
+
+        } catch (Exception e) {
+            Logger.error("Shell configuration validation failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Get list of users to check shell configs for
+     */
+    private string[] getUserList(ref SystemInfo sysInfo) {
+        import std.algorithm : filter, map;
+        import std.array : array;
+        import std.string : split;
+
+        string[] users;
+
+        try {
+            string passwdPath = buildPath(sysInfo.mountPoint, "etc", "passwd");
+            if (!exists(passwdPath)) return users;
+
+            string content = readText(passwdPath);
+            foreach (line; content.split('\n')) {
+                if (line.length == 0 || line.startsWith("#")) continue;
+
+                string[] fields = line.split(':');
+                if (fields.length >= 7) {
+                    string username = fields[0];
+                    string shell = fields[6];
+                    int uid = fields[2].to!int;
+
+                    // Only check regular users (UID >= 1000) and root
+                    if ((uid >= 1000 && uid < 65534) || uid == 0) {
+                        if (shell.endsWith("bash") || shell.endsWith("zsh") ||
+                            shell.endsWith("fish") || shell.endsWith("sh")) {
+                            users ~= username;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Logger.error("Failed to get user list: " ~ e.msg);
+        }
+
+        return users;
+    }
+
+    /**
+     * Validate system-wide shell configurations
+     */
+    private bool validateSystemShellConfigs(ref SystemInfo sysInfo) {
+        bool anyFixed = false;
+
+        string[] systemConfigs = [
+            "/etc/bash.bashrc",
+            "/etc/zsh/zshrc",
+            "/etc/fish/config.fish",
+            "/etc/profile"
+        ];
+
+        foreach (configPath; systemConfigs) {
+            string fullPath = buildPath(sysInfo.mountPoint, configPath[1..$]); // Remove leading /
+            if (exists(fullPath)) {
+                if (validateSingleShellConfig(sysInfo, configPath, "system")) {
+                    anyFixed = true;
+                }
+            }
+        }
+
+        return anyFixed;
+    }
+
+    /**
+     * Validate user shell configurations
+     */
+    private bool validateUserShellConfigs(ref SystemInfo sysInfo, string username) {
+        bool anyFixed = false;
+
+        string homeDir = "/home/" ~ username;
+        if (username == "root") homeDir = "/root";
+
+        string[] userConfigs = [
+            "/.bashrc",
+            "/.bash_profile",
+            "/.zshrc",
+            "/.config/fish/config.fish",
+            "/.profile"
+        ];
+
+        foreach (configFile; userConfigs) {
+            string configPath = homeDir ~ configFile;
+            string fullPath = buildPath(sysInfo.mountPoint, configPath[1..$]); // Remove leading /
+
+            if (exists(fullPath)) {
+                if (validateSingleShellConfig(sysInfo, configPath, username)) {
+                    anyFixed = true;
+                }
+            }
+        }
+
+        return anyFixed;
+    }
+
+    /**
+     * Validate a single shell configuration file
+     */
+    private bool validateSingleShellConfig(ref SystemInfo sysInfo, string configPath, string owner) {
+        import std.file : copy, readText;
+        import std.path : baseName, extension;
+
+        try {
+            string fullPath = buildPath(sysInfo.mountPoint, configPath[1..$]);
+            string content = readText(fullPath);
+
+            // Detect shell type from path
+            string shellType = "bash"; // default
+            if (configPath.indexOf("zsh") != -1) shellType = "zsh";
+            else if (configPath.indexOf("fish") != -1) shellType = "fish";
+
+            // Basic syntax validation
+            bool hasErrors = false;
+            string[] errors;
+
+            // Check for common syntax errors
+            if (shellType == "bash" || shellType == "zsh") {
+                hasErrors |= checkBashZshSyntax(content, configPath, errors);
+            } else if (shellType == "fish") {
+                hasErrors |= checkFishSyntax(content, configPath, errors);
+            }
+
+            if (hasErrors) {
+                ui.printWarning("! Syntax errors found in " ~ configPath ~ " (owner: " ~ owner ~ ")");
+                foreach (error; errors) {
+                    ui.printInfo("  " ~ error);
+                }
+
+                // Create backup
+                string backupPath = fullPath ~ ".debork-backup-" ~
+                                   Clock.currTime().toISOExtString()[0..19].replace(":", "-");
+                copy(fullPath, backupPath);
+                ui.printInfo("  Created backup: " ~ backupPath);
+
+                // Offer to fix or disable
+                return offerShellConfigFix(sysInfo, fullPath, configPath, content, shellType);
+            }
+
+            return false;
+
+        } catch (Exception e) {
+            Logger.error("Failed to validate " ~ configPath ~ ": " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Check bash/zsh syntax for common errors
+     */
+    private bool checkBashZshSyntax(string content, string configPath, ref string[] errors) {
+        import std.string : split, strip, indexOf;
+
+        bool hasErrors = false;
+        string[] lines = content.split('\n');
+
+        for (int i = 0; i < lines.length; i++) {
+            string line = lines[i].strip();
+            if (line.length == 0 || line.startsWith("#")) continue;
+
+            // Check for unmatched quotes
+            int singleQuotes = 0, doubleQuotes = 0;
+            bool inSingle = false, inDouble = false;
+
+            for (int j = 0; j < line.length; j++) {
+                char c = line[j];
+                if (c == '\'' && !inDouble) {
+                    inSingle = !inSingle;
+                    singleQuotes++;
+                }
+                else if (c == '"' && !inSingle) {
+                    inDouble = !inDouble;
+                    doubleQuotes++;
+                }
+            }
+
+            if (singleQuotes % 2 != 0) {
+                errors ~= "Line " ~ (i+1).to!string ~ ": Unmatched single quote";
+                hasErrors = true;
+            }
+            if (doubleQuotes % 2 != 0) {
+                errors ~= "Line " ~ (i+1).to!string ~ ": Unmatched double quote";
+                hasErrors = true;
+            }
+
+            // Check for unmatched brackets/braces
+            if (line.indexOf("[") != -1 && line.indexOf("]") == -1) {
+                errors ~= "Line " ~ (i+1).to!string ~ ": Unmatched square bracket";
+                hasErrors = true;
+            }
+
+            // Check for dangerous commands without proper checks
+            if (line.indexOf("rm -rf") != -1 && line.indexOf("$") != -1) {
+                errors ~= "Line " ~ (i+1).to!string ~ ": Potentially dangerous rm command with variables";
+                hasErrors = true;
+            }
+        }
+
+        return hasErrors;
+    }
+
+    /**
+     * Check fish syntax for common errors
+     */
+    private bool checkFishSyntax(string content, string configPath, ref string[] errors) {
+        import std.string : split, strip, indexOf;
+
+        bool hasErrors = false;
+        string[] lines = content.split('\n');
+
+        for (int i = 0; i < lines.length; i++) {
+            string line = lines[i].strip();
+            if (line.length == 0 || line.startsWith("#")) continue;
+
+            // Fish-specific syntax checks
+            if (line.startsWith("function") && !line.endsWith(";")) {
+                if (i + 1 < lines.length && !lines[i + 1].strip().startsWith("end")) {
+                    errors ~= "Line " ~ (i+1).to!string ~ ": Function missing 'end'";
+                    hasErrors = true;
+                }
+            }
+
+            if (line.startsWith("if") && !line.endsWith(";")) {
+                // Look for matching 'end'
+                bool foundEnd = false;
+                for (int j = i + 1; j < lines.length; j++) {
+                    if (lines[j].strip() == "end") {
+                        foundEnd = true;
+                        break;
+                    }
+                }
+                if (!foundEnd) {
+                    errors ~= "Line " ~ (i+1).to!string ~ ": If statement missing 'end'";
+                    hasErrors = true;
+                }
+            }
+        }
+
+        return hasErrors;
+    }
+
+    /**
+     * Offer to fix shell configuration issues
+     */
+    private bool offerShellConfigFix(ref SystemInfo sysInfo, string fullPath, string configPath,
+                                   string content, string shellType) {
+        MenuOption[] fixOptions = [
+            MenuOption("Comment out problematic lines", "Add # to disable problematic lines", true),
+            MenuOption("Create minimal safe config", "Replace with basic safe configuration", true),
+            MenuOption("Rename to .disabled", "Disable the config file entirely", true),
+            MenuOption("Skip", "Leave as-is (may cause login issues)", true)
+        ];
+
+        ui.printInfo("How would you like to handle this configuration?");
+        int choice = ui.showMenu(fixOptions);
+
+        try {
+            switch (choice) {
+                case 0: // Comment out problematic lines
+                    return commentOutProblematicLines(fullPath, content);
+
+                case 1: // Create minimal safe config
+                    return createMinimalSafeConfig(fullPath, shellType);
+
+                case 2: // Rename to disabled
+                    import std.file : rename;
+                    rename(fullPath, fullPath ~ ".disabled");
+                    ui.printStatus("✓ Disabled configuration file");
+                    return true;
+
+                default: // Skip
+                    return false;
+            }
+        } catch (Exception e) {
+            Logger.error("Failed to fix shell config: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Comment out lines that cause syntax errors
+     */
+    private bool commentOutProblematicLines(string fullPath, string content) {
+        import std.string : split, indexOf;
+        import std.array : join;
+        import std.file : write;
+
+        string[] lines = content.split('\n');
+        bool modified = false;
+
+        for (int i = 0; i < lines.length; i++) {
+            string line = lines[i];
+
+            // Comment out lines with obvious syntax issues
+            if (line.indexOf("rm -rf") != -1 && line.indexOf("$") != -1) {
+                lines[i] = "# DEBORK: Commented out potentially dangerous command: " ~ line;
+                modified = true;
+            }
+            // Add more problematic pattern checks here
+        }
+
+        if (modified) {
+            write(fullPath, lines.join('\n'));
+            ui.printStatus("✓ Commented out problematic lines");
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Create a minimal safe shell configuration
+     */
+    private bool createMinimalSafeConfig(string fullPath, string shellType) {
+        import std.file : write;
+
+        string safeConfig = "";
+
+        switch (shellType) {
+            case "bash":
+                safeConfig = `# Safe minimal bash configuration created by debork
+# Original file backed up with .debork-backup suffix
+
+# Basic settings
+export EDITOR=nano
+export PAGER=less
+
+# Safe aliases
+alias ls='ls --color=auto'
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+
+# Basic prompt
+PS1='\u@\h:\w\$ '
+`;
+                break;
+
+            case "zsh":
+                safeConfig = `# Safe minimal zsh configuration created by debork
+# Original file backed up with .debork-backup suffix
+
+# Basic settings
+export EDITOR=nano
+export PAGER=less
+
+# Safe aliases
+alias ls='ls --color=auto'
+alias ll='ls -alF'
+
+# Basic prompt
+PROMPT='%n@%m:%~%# '
+`;
+                break;
+
+            case "fish":
+                safeConfig = `# Safe minimal fish configuration created by debork
+# Original file backed up with .debork-backup suffix
+
+# Basic settings
+set -x EDITOR nano
+set -x PAGER less
+
+# Safe aliases
+alias ls='ls --color=auto'
+alias ll='ls -alF'
+`;
+                break;
+
+            default:
+                safeConfig = `# Safe minimal shell configuration created by debork
+# Original file backed up with .debork-backup suffix
+
+export EDITOR=nano
+export PAGER=less
+`;
+                break;
+        }
+
+        write(fullPath, safeConfig);
+        ui.printStatus("✓ Created minimal safe configuration");
+        return true;
+    }
+
+    /**
+     * Remove Plymouth from GRUB configuration
+     */
+    bool removePlymouthFromGrub(ref SystemInfo sysInfo) {
+        ui.printInfo("Removing Plymouth splash from GRUB configuration...");
+
+        try {
+            string grubDefault = buildPath(sysInfo.mountPoint, "etc", "default", "grub");
+
+            if (!exists(grubDefault)) {
+                ui.printWarning("! GRUB default configuration not found");
+                return false;
+            }
+
+            string content = readText(grubDefault);
+            string originalContent = content;
+            bool modified = false;
+
+            // Remove splash parameter from GRUB_CMDLINE_LINUX_DEFAULT
+            if (content.indexOf("splash") != -1) {
+                import std.regex;
+
+                // Remove 'splash' from GRUB_CMDLINE_LINUX_DEFAULT
+                auto splashRegex = regex(r'GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)\bsplash\b([^"]*)"');
+                content = content.replaceAll(splashRegex, `GRUB_CMDLINE_LINUX_DEFAULT="$1$2"`);
+
+                // Clean up double spaces
+                content = content.replaceAll(regex(r'="([^"]*)\s+([^"]*)"'), `="$1 $2"`);
+                content = content.replaceAll(regex(r'="([^"]*)\s+"'), `="$1"`);
+                content = content.replaceAll(regex(r'="\s+([^"]*)"'), `="$1"`);
+
+                modified = true;
+                Logger.info("Removed splash parameter from GRUB configuration");
+            }
+
+            // Remove quiet parameter if user wants
+            if (content.indexOf("quiet") != -1) {
+                ui.printInfo("Also remove 'quiet' parameter? (shows boot messages)");
+                MenuOption[] options = [
+                    MenuOption("Yes", "Remove quiet parameter to show boot messages", true),
+                    MenuOption("No", "Keep quiet parameter", true)
+                ];
+
+                int choice = ui.showMenu(options);
+                if (choice == 0) {
+                    auto quietRegex = regex(r'GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)\bquiet\b([^"]*)"');
+                    content = content.replaceAll(quietRegex, `GRUB_CMDLINE_LINUX_DEFAULT="$1$2"`);
+
+                    // Clean up double spaces again
+                    content = content.replaceAll(regex(r'="([^"]*)\s+([^"]*)"'), `="$1 $2"`);
+                    content = content.replaceAll(regex(r'="([^"]*)\s+"'), `="$1"`);
+                    content = content.replaceAll(regex(r'="\s+([^"]*)"'), `="$1"`);
+
+                    modified = true;
+                    Logger.info("Removed quiet parameter from GRUB configuration");
+                }
+            }
+
+            if (modified) {
+                write(grubDefault, content);
+                ui.printStatus("✓ Updated GRUB configuration");
+
+                // Regenerate GRUB configuration
+                auto result = ChrootManager.executeInChroot(sysInfo, ["grub-mkconfig", "-o", "/boot/grub/grub.cfg"]);
+                if (result.status == 0) {
+                    ui.printStatus("✓ GRUB configuration regenerated");
+                    return true;
+                } else {
+                    ui.printWarning("! GRUB configuration updated but regeneration failed");
+                    ui.printInfo("  You may need to run: grub-mkconfig -o /boot/grub/grub.cfg");
+                    return true; // Still count as success since we modified the config
+                }
+            } else {
+                ui.printInfo("No Plymouth parameters found in GRUB configuration");
+                return true;
+            }
+
+        } catch (Exception e) {
+            Logger.error("Failed to remove Plymouth from GRUB: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Diagnose critical system issues (diagnostic only - safe)
+     */
+    bool diagnoseCriticalSystemIssues(ref SystemInfo sysInfo) {
+        ui.printInfo("Diagnosing critical system issues...");
+
+        bool anyIssuesFound = false;
+
+        try {
+            // Diagnose package database
+            anyIssuesFound |= diagnosePackageDatabase(sysInfo);
+
+            // Diagnose critical system services
+            anyIssuesFound |= diagnoseCriticalServices(sysInfo);
+
+            // Diagnose filesystem issues
+            anyIssuesFound |= diagnoseFilesystemIssues(sysInfo);
+
+            // Diagnose broken symlinks in critical paths
+            anyIssuesFound |= diagnoseCriticalSymlinks(sysInfo);
+
+            // Diagnose /tmp and /var permissions
+            anyIssuesFound |= diagnoseCriticalDirectoryPermissions(sysInfo);
+
+            if (anyIssuesFound) {
+                ui.printWarning("! Issues found - manual intervention may be required");
+            } else {
+                ui.printStatus("✓ No critical system issues detected");
+            }
+
+            return anyIssuesFound;
+
+        } catch (Exception e) {
+            Logger.error("Critical system diagnosis failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Diagnose package database issues (diagnostic only)
+     */
+    private bool diagnosePackageDatabase(ref SystemInfo sysInfo) {
+        ui.printInfo("Checking package database integrity...");
+
+        try {
+            bool issuesFound = false;
+
+            // Check pacman database
+            if (sysInfo.packageManager == PackageManager.PACMAN) {
+                auto result = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Dk"]);
+                if (result.status != 0) {
+                    ui.printWarning("! Pacman database corruption detected");
+                    ui.printInfo("  Manual fix: Run 'pacman-db-upgrade' and 'here update'");
+                    issuesFound = true;
+                } else {
+                    ui.printStatus("✓ Pacman database is healthy");
+                }
+            }
+
+            return issuesFound;
+
+        } catch (Exception e) {
+            Logger.error("Package database diagnosis failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Diagnose critical system services
+     */
+    private bool diagnoseCriticalServices(ref SystemInfo sysInfo) {
+        ui.printInfo("Checking critical system services...");
+
+        try {
+            bool issuesFound = false;
+
+            string[] criticalServices = [
+                "systemd-logind.service",
+                "dbus.service",
+                "systemd-resolved.service"
+            ];
+
+            foreach (service; criticalServices) {
+                auto statusResult = ChrootManager.executeInChroot(sysInfo,
+                    ["systemctl", "is-enabled", service]);
+
+                if (statusResult.output.strip() == "masked") {
+                    ui.printWarning("! Critical service is masked: " ~ service);
+                    ui.printInfo("  Manual fix: systemctl unmask " ~ service);
+                    issuesFound = true;
+                } else if (statusResult.output.strip() == "disabled") {
+                    ui.printWarning("! Critical service is disabled: " ~ service);
+                    ui.printInfo("  Consider: systemctl enable " ~ service);
+                    issuesFound = true;
+                } else {
+                    ui.printStatus("✓ " ~ service ~ " is properly configured");
+                }
+            }
+
+            return issuesFound;
+
+        } catch (Exception e) {
+            Logger.error("Critical services diagnosis failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Diagnose filesystem issues
+     */
+    private bool diagnoseFilesystemIssues(ref SystemInfo sysInfo) {
+        ui.printInfo("Checking filesystem integrity...");
+
+        try {
+            bool issuesFound = false;
+
+            // Check for read-only filesystem
+            auto mountResult = ChrootManager.executeInChroot(sysInfo, ["mount"]);
+            if (mountResult.output.indexOf("ro,") != -1) {
+                ui.printWarning("! Root filesystem is mounted read-only");
+                ui.printInfo("  This may indicate filesystem errors");
+                ui.printInfo("  Manual fix: fsck " ~ sysInfo.device ~ " (when unmounted)");
+                issuesFound = true;
+            } else {
+                ui.printStatus("✓ Root filesystem is mounted read-write");
+            }
+
+            // Check /tmp directory
+            string tmpDir = buildPath(sysInfo.mountPoint, "tmp");
+            if (!exists(tmpDir)) {
+                ui.printWarning("! /tmp directory missing");
+                ui.printInfo("  Manual fix: mkdir /tmp && chmod 1777 /tmp");
+                issuesFound = true;
+            } else {
+                ui.printStatus("✓ /tmp directory exists");
+            }
+
+            return issuesFound;
+
+        } catch (Exception e) {
+            Logger.error("Filesystem diagnosis failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Diagnose broken symlinks in critical system paths
+     */
+    private bool diagnoseCriticalSymlinks(ref SystemInfo sysInfo) {
+        ui.printInfo("Checking for broken symlinks...");
+
+        try {
+            bool issuesFound = false;
+
+            string[] criticalPaths = [
+                "/etc/resolv.conf",
+                "/etc/localtime",
+                "/lib64",
+                "/bin",
+                "/sbin"
+            ];
+
+            foreach (path; criticalPaths) {
+                string fullPath = buildPath(sysInfo.mountPoint, path[1..$]);
+                if (exists(fullPath) && isSymlink(fullPath)) {
+                    try {
+                        // Try to read the symlink target
+                        string target = readLink(fullPath);
+                        string absoluteTarget = buildPath(sysInfo.mountPoint, target[1..$]);
+
+                        if (!exists(absoluteTarget)) {
+                            ui.printWarning("! Broken symlink detected: " ~ path ~ " -> " ~ target);
+                            ui.printInfo("  Manual fix: Remove and recreate symlink");
+                            issuesFound = true;
+                        } else {
+                            ui.printStatus("✓ " ~ path ~ " symlink is valid");
+                        }
+                    } catch (Exception e) {
+                        // Symlink is broken
+                        ui.printWarning("! Broken symlink: " ~ path);
+                        ui.printInfo("  Manual fix: Remove and recreate symlink");
+                        issuesFound = true;
+                    }
+                } else if (exists(fullPath)) {
+                    ui.printStatus("✓ " ~ path ~ " exists and is not a symlink");
+                }
+            }
+
+            return issuesFound;
+
+        } catch (Exception e) {
+            Logger.error("Symlink diagnosis failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Diagnose critical directory permissions
+     */
+    private bool diagnoseCriticalDirectoryPermissions(ref SystemInfo sysInfo) {
+        ui.printInfo("Checking critical directory permissions...");
+
+        try {
+            bool issuesFound = false;
+
+            struct DirPerms {
+                string path;
+                string expectedPerms;
+            }
+
+            DirPerms[] criticalDirs = [
+                DirPerms("/tmp", "1777"),
+                DirPerms("/var/tmp", "1777"),
+                DirPerms("/var/log", "755"),
+                DirPerms("/etc", "755"),
+                DirPerms("/boot", "755")
+            ];
+
+            foreach (dir; criticalDirs) {
+                string fullPath = buildPath(sysInfo.mountPoint, dir.path[1..$]);
+                if (exists(fullPath)) {
+                    auto result = ChrootManager.executeInChroot(sysInfo,
+                        ["stat", "-c", "%a", dir.path]);
+                    if (result.status == 0) {
+                        string actualPerms = result.output.strip();
+                        if (actualPerms != dir.expectedPerms) {
+                            ui.printWarning("! " ~ dir.path ~ " has permissions " ~ actualPerms ~
+                                          " (expected " ~ dir.expectedPerms ~ ")");
+                            ui.printInfo("  Manual fix: chmod " ~ dir.expectedPerms ~ " " ~ dir.path);
+                            issuesFound = true;
+                        } else {
+                            ui.printStatus("✓ " ~ dir.path ~ " has correct permissions");
+                        }
+                    }
+                } else {
+                    ui.printWarning("! " ~ dir.path ~ " does not exist");
+                    issuesFound = true;
+                }
+            }
+
+            return issuesFound;
+
+        } catch (Exception e) {
+            Logger.error("Directory permissions diagnosis failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Validate and fix network configuration
+     */
+    bool validateNetworkConfiguration(ref SystemInfo sysInfo) {
+        ui.printInfo("Checking network configuration...");
+
+        try {
+            bool hasConnection = testNetworkConnectivity(sysInfo);
+            bool hasValidConfig = validateNetworkManagerConfig(sysInfo);
+
+            if (hasConnection && hasValidConfig) {
+                ui.printStatus("✓ Network is working correctly");
+                return false; // No fixes needed
+            }
+
+            if (!hasValidConfig) {
+                ui.printWarning("! Network configuration issues detected");
+                return fixNetworkConfiguration(sysInfo);
+            }
+
+            if (!hasConnection) {
+                ui.printWarning("! No network connectivity");
+                return offerNetworkConfiguration(sysInfo);
+            }
+
+            return false;
+
+        } catch (Exception e) {
+            Logger.error("Network validation failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Test network connectivity
+     */
+    private bool testNetworkConnectivity(ref SystemInfo sysInfo) {
+        ui.printInfo("Testing network connectivity...");
+
+        // Test DNS resolution and connectivity
+        string[] testCommands = [
+            ["ping", "-c", "1", "-W", "3", "8.8.8.8"],          // Google DNS
+            ["ping", "-c", "1", "-W", "3", "1.1.1.1"],          // Cloudflare DNS
+            ["nslookup", "google.com"]                           // DNS resolution
+        ];
+
+        int successCount = 0;
+        foreach (cmd; testCommands) {
+            auto result = ChrootManager.executeInChroot(sysInfo, cmd);
+            if (result.status == 0) {
+                successCount++;
+            }
+        }
+
+        bool hasConnectivity = successCount >= 2;
+        if (hasConnectivity) {
+            ui.printStatus("✓ Network connectivity is working");
+        } else {
+            ui.printWarning("! No network connectivity detected");
+        }
+
+        return hasConnectivity;
+    }
+
+    /**
+     * Validate NetworkManager configuration
+     */
+    private bool validateNetworkManagerConfig(ref SystemInfo sysInfo) {
+        try {
+            // Check if NetworkManager is installed and enabled
+            auto nmCheck = ChrootManager.executeInChroot(sysInfo, ["systemctl", "is-enabled", "NetworkManager.service"]);
+            if (nmCheck.status != 0) {
+                ui.printWarning("! NetworkManager is not enabled");
+                return false;
+            }
+
+            // Check for basic NetworkManager configuration
+            string nmConfDir = buildPath(sysInfo.mountPoint, "etc", "NetworkManager");
+            if (!exists(nmConfDir)) {
+                ui.printWarning("! NetworkManager configuration directory missing");
+                return false;
+            }
+
+            // Check for network connections
+            auto connectionCheck = ChrootManager.executeInChroot(sysInfo, ["nmcli", "connection", "show"]);
+            if (connectionCheck.status != 0) {
+                ui.printWarning("! No network connections configured");
+                return false;
+            }
+
+            return true;
+
+        } catch (Exception e) {
+            Logger.error("NetworkManager validation failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Fix basic network configuration issues
+     */
+    private bool fixNetworkConfiguration(ref SystemInfo sysInfo) {
+        ui.printInfo("Attempting to fix network configuration...");
+        bool anyFixed = false;
+
+        try {
+            // Enable NetworkManager if not enabled
+            auto nmCheck = ChrootManager.executeInChroot(sysInfo, ["systemctl", "is-enabled", "NetworkManager.service"]);
+            if (nmCheck.status != 0) {
+                ui.printInfo("Enabling NetworkManager service...");
+                auto enableResult = ChrootManager.executeInChroot(sysInfo, ["systemctl", "enable", "NetworkManager.service"]);
+                if (enableResult.status == 0) {
+                    ui.printStatus("✓ NetworkManager enabled");
+                    anyFixed = true;
+                }
+            }
+
+            // Check if networkmanager package is installed
+            auto packageCheck = ChrootManager.executeInChroot(sysInfo, ["which", "nmcli"]);
+            if (packageCheck.status != 0) {
+                ui.printInfo("NetworkManager not installed. Installing...");
+                if (installPackageUniversal(sysInfo, "networkmanager")) {
+                    ui.printStatus("✓ NetworkManager installed");
+                    // Enable it too
+                    ChrootManager.executeInChroot(sysInfo, ["systemctl", "enable", "NetworkManager.service"]);
+                    anyFixed = true;
+                }
+            }
+
+            // Disable conflicting network services
+            string[] conflictingServices = ["dhcpcd.service", "netctl.service"];
+            foreach (service; conflictingServices) {
+                auto disableResult = ChrootManager.executeInChroot(sysInfo, ["systemctl", "disable", service]);
+                if (disableResult.status == 0) {
+                    ui.printInfo("Disabled conflicting service: " ~ service);
+                    anyFixed = true;
+                }
+            }
+
+            return anyFixed;
+
+        } catch (Exception e) {
+            Logger.error("Failed to fix network configuration: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Offer network configuration options to user
+     */
+    private bool offerNetworkConfiguration(ref SystemInfo sysInfo) {
+        ui.printInfo("Network connectivity issues detected. How would you like to proceed?");
+
+        MenuOption[] networkOptions = [
+            MenuOption("Launch nmtui", "Use NetworkManager Text UI to configure network", true),
+            MenuOption("Try automatic network setup", "Attempt automatic DHCP configuration", true),
+            MenuOption("Install NetworkManager", "Install and configure NetworkManager", true),
+            MenuOption("Skip network setup", "Continue without network (limited functionality)", true)
+        ];
+
+        int choice = ui.showMenu(networkOptions);
+
+        switch (choice) {
+            case 0: // Launch nmtui
+                return launchNetworkManagerTUI(sysInfo);
+
+            case 1: // Automatic setup
+                return attemptAutomaticNetworkSetup(sysInfo);
+
+            case 2: // Install NetworkManager
+                return installAndConfigureNetworkManager(sysInfo);
+
+            default: // Skip
+                ui.printWarning("! Skipping network setup - some repair operations may fail");
+                return false;
+        }
+    }
+
+    /**
+     * Launch NetworkManager Text UI for network configuration
+     */
+    bool launchNetworkManagerTUI(ref SystemInfo sysInfo) {
+        ui.printInfo("Launching NetworkManager Text UI...");
+        ui.printInfo("Configure your network connection and press ESC to exit when done.");
+        ui.printInfo("Press any key to continue...");
+        ui.waitForKey();
+
+        try {
+            // Clear screen and launch nmtui in chroot
+            ui.clearScreen();
+            auto result = ChrootManager.executeInChroot(sysInfo, ["nmtui"]);
+
+            ui.clearScreen();
+            ui.printHeader();
+
+            if (result.status == 0) {
+                ui.printStatus("✓ Network configuration completed");
+
+                // Test connectivity after configuration
+                if (testNetworkConnectivity(sysInfo)) {
+                    ui.printStatus("✓ Network connectivity verified");
+                    return true;
+                } else {
+                    ui.printWarning("! Network configured but connectivity test failed");
+                    return false;
+                }
+            } else {
+                ui.printError("Network configuration failed or was cancelled");
+                return false;
+            }
+
+        } catch (Exception e) {
+            Logger.error("Failed to launch nmtui: " ~ e.msg);
+            ui.printError("Could not launch network configuration tool");
+            return false;
+        }
+    }
+
+    /**
+     * Attempt automatic network setup
+     */
+    bool attemptAutomaticNetworkSetup(ref SystemInfo sysInfo) {
+        ui.printInfo("Attempting automatic network setup...");
+
+        try {
+            // Start NetworkManager if not running
+            ChrootManager.executeInChroot(sysInfo, ["systemctl", "start", "NetworkManager.service"]);
+
+            // Wait a moment for NetworkManager to initialize
+            import core.thread;
+            Thread.sleep(3000.msecs);
+
+            // Try to connect to available networks
+            auto scanResult = ChrootManager.executeInChroot(sysInfo, ["nmcli", "device", "wifi", "rescan"]);
+            Thread.sleep(2000.msecs);
+
+            auto connectResult = ChrootManager.executeInChroot(sysInfo, ["nmcli", "device", "connect", "eth0"]);
+            if (connectResult.status != 0) {
+                // Try with different interface names
+                string[] interfaces = ["enp0s3", "enp0s8", "ens33", "wlan0"];
+                foreach (iface; interfaces) {
+                    auto result = ChrootManager.executeInChroot(sysInfo, ["nmcli", "device", "connect", iface]);
+                    if (result.status == 0) break;
+                }
+            }
+
+            // Test connectivity
+            Thread.sleep(2000.msecs);
+            if (testNetworkConnectivity(sysInfo)) {
+                ui.printStatus("✓ Automatic network setup successful");
+                return true;
+            } else {
+                ui.printWarning("! Automatic setup failed - try manual configuration");
+                return false;
+            }
+
+        } catch (Exception e) {
+            Logger.error("Automatic network setup failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Install and configure NetworkManager
+     */
+    bool installAndConfigureNetworkManager(ref SystemInfo sysInfo) {
+        ui.printInfo("Installing and configuring NetworkManager...");
+
+        try {
+            // Install NetworkManager and related packages
+            string[] packages = ["networkmanager", "network-manager-applet"];
+            bool installSuccess = true;
+
+            foreach (pkg; packages) {
+                if (!installPackageUniversal(sysInfo, pkg)) {
+                    installSuccess = false;
+                    break;
+                }
+            }
+
+            auto installResult = CommandResult();
+            installResult.status = installSuccess ? 0 : 1;
+
+            if (installResult.status != 0) {
+                ui.printError("Failed to install NetworkManager packages");
+                return false;
+            }
+
+            // Enable and start NetworkManager
+            ChrootManager.executeInChroot(sysInfo, ["systemctl", "enable", "NetworkManager.service"]);
+            ChrootManager.executeInChroot(sysInfo, ["systemctl", "start", "NetworkManager.service"]);
+
+            // Disable conflicting services
+            string[] conflictingServices = ["dhcpcd.service", "netctl.service"];
+            foreach (service; conflictingServices) {
+                ChrootManager.executeInChroot(sysInfo, ["systemctl", "disable", service]);
+                ChrootManager.executeInChroot(sysInfo, ["systemctl", "stop", service]);
+            }
+
+            ui.printStatus("✓ NetworkManager installed and configured");
+
+            // Offer to configure network now
+            ui.printInfo("Would you like to configure network connections now?");
+            MenuOption[] configOptions = [
+                MenuOption("Yes", "Configure network now with nmtui", true),
+                MenuOption("No", "Configure later after reboot", true)
+            ];
+
+            int choice = ui.showMenu(configOptions);
+            if (choice == 0) {
+                return launchNetworkManagerTUI(sysInfo);
+            }
+
+            return true;
+
+        } catch (Exception e) {
+            Logger.error("Failed to install NetworkManager: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Check if 'here' universal package manager is available
+     */
+    private bool checkHereAvailability(ref SystemInfo sysInfo) {
+        try {
+            auto result = ChrootManager.executeInChroot(sysInfo, ["which", "here"]);
+            return result.status == 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Install package using universal method (here if available, fallback to distro-specific)
+     */
+    private bool installPackageUniversal(ref SystemInfo sysInfo, string packageName) {
+        try {
+            // First try 'here' universal package manager
+            auto hereResult = ChrootManager.executeInChroot(sysInfo, ["here", "install", packageName]);
+            if (hereResult.status == 0) {
+                ui.printStatus("✓ Installed " ~ packageName ~ " via here");
+                return true;
+            }
+
+            // Fallback to distribution-specific commands
+            return installPackageFallback(sysInfo, packageName);
+
+        } catch (Exception e) {
+            Logger.error("Package installation failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Fallback package installation using distribution-specific commands
+     */
+    private bool installPackageFallback(ref SystemInfo sysInfo, string packageName) {
+        try {
+            // Try pacman (Arch Linux)
+            auto pacmanResult = ChrootManager.executeInChroot(sysInfo, ["pacman", "-S", "--noconfirm", packageName]);
+            if (pacmanResult.status == 0) {
+                ui.printStatus("✓ Installed " ~ packageName ~ " via pacman");
+                return true;
+            }
+
+            // Try apt (Debian/Ubuntu)
+            auto aptResult = ChrootManager.executeInChroot(sysInfo, ["apt", "install", "-y", packageName]);
+            if (aptResult.status == 0) {
+                ui.printStatus("✓ Installed " ~ packageName ~ " via apt");
+                return true;
+            }
+
+            // Try dnf (Fedora)
+            auto dnfResult = ChrootManager.executeInChroot(sysInfo, ["dnf", "install", "-y", packageName]);
+            if (dnfResult.status == 0) {
+                ui.printStatus("✓ Installed " ~ packageName ~ " via dnf");
+                return true;
+            }
+
+            // Try zypper (openSUSE)
+            auto zypperResult = ChrootManager.executeInChroot(sysInfo, ["zypper", "install", "-y", packageName]);
+            if (zypperResult.status == 0) {
+                ui.printStatus("✓ Installed " ~ packageName ~ " via zypper");
+                return true;
+            }
+
+            ui.printError("Failed to install " ~ packageName ~ " - no suitable package manager found");
+            return false;
+
+        } catch (Exception e) {
+            Logger.error("Fallback package installation failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Update packages using universal method
+     */
+    bool updatePackagesUniversal(ref SystemInfo sysInfo) {
+        ui.printInfo("Updating system packages...");
+
+        try {
+            // First try 'here' universal package manager
+            auto hereResult = ChrootManager.executeInChroot(sysInfo, ["here", "update"]);
+            if (hereResult.status == 0) {
+                ui.printStatus("✓ System updated via here");
+                return true;
+            }
+
+            // Fallback to distribution-specific commands
+            return updatePackagesFallback(sysInfo);
+
+        } catch (Exception e) {
+            Logger.error("Package update failed: " ~ e.msg);
+            return false;
+        }
+    }
+
+    /**
+     * Fallback package update using distribution-specific commands
+     */
+    private bool updatePackagesFallback(ref SystemInfo sysInfo) {
+        try {
+            // Try pacman (Arch Linux)
+            auto pacmanResult = ChrootManager.executeInChroot(sysInfo, ["pacman", "-Syu", "--noconfirm"]);
+            if (pacmanResult.status == 0) {
+                ui.printStatus("✓ System updated via pacman");
+                return true;
+            }
+
+            // Try apt (Debian/Ubuntu)
+            ChrootManager.executeInChroot(sysInfo, ["apt", "update"]);
+            auto aptResult = ChrootManager.executeInChroot(sysInfo, ["apt", "upgrade", "-y"]);
+            if (aptResult.status == 0) {
+                ui.printStatus("✓ System updated via apt");
+                return true;
+            }
+
+            // Try dnf (Fedora)
+            auto dnfResult = ChrootManager.executeInChroot(sysInfo, ["dnf", "update", "-y"]);
+            if (dnfResult.status == 0) {
+                ui.printStatus("✓ System updated via dnf");
+                return true;
+            }
+
+            // Try zypper (openSUSE)
+            auto zypperResult = ChrootManager.executeInChroot(sysInfo, ["zypper", "update", "-y"]);
+            if (zypperResult.status == 0) {
+                ui.printStatus("✓ System updated via zypper");
+                return true;
+            }
+
+            ui.printError("Failed to update packages - no suitable package manager found");
+            return false;
+
+        } catch (Exception e) {
+            Logger.error("Fallback package update failed: " ~ e.msg);
+            return false;
         }
     }
 

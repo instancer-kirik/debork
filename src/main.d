@@ -219,21 +219,23 @@ class DeborkApp {
     private int runMainMenu() {
         MenuOption[] mainMenu = [
             MenuOption("Fix My System (Complete Repair)",
-                      "Update packages, regenerate initramfs, fix bootloader", true),
+                      "Update packages, regenerate initramfs, fix bootloader & graphics", true),
             MenuOption("Emergency Shell (Manual Fixes)",
                       "Interactive chroot shell for manual repairs", true),
             MenuOption("Regenerate Initramfs Only",
                       "Rebuild initramfs for all kernels", true),
+            MenuOption("Fix Graphics Drivers",
+                      "Fix X11/Wayland graphics driver configuration", true),
+            MenuOption("Configure Network",
+                      "Setup and test network connectivity", true),
             MenuOption("Fix Bootloader Only",
                       "Repair bootloader configuration", true),
             MenuOption("Clean & Fix rEFInd",
                       "Clean duplicate entries and fix rEFInd configuration", true),
             MenuOption("Fix Dual-EFI Boot",
                       "Fix boot with /boot on separate EFI partition", true),
-            MenuOption("Show System Information",
-                      "Display detected system details", true),
-            MenuOption("Diagnose System Issues",
-                      "Analyze and diagnose system problems", true),
+            MenuOption("System Diagnostics",
+                      "Comprehensive system analysis and diagnostics", true),
             MenuOption("Advanced Options",
                       "Additional repair and maintenance tools", true),
             MenuOption("Exit",
@@ -266,31 +268,39 @@ class DeborkApp {
                     regenerateInitramfs(repairOps);
                     break;
 
-                case 3: // Fix Bootloader
+                case 3: // Fix Graphics Drivers
+                    fixGraphicsDrivers(repairOps);
+                    break;
+
+                case 4: // Configure Network
+                    configureNetwork(repairOps);
+                    break;
+
+                case 5: // Fix Bootloader
                     fixBootloader(repairOps);
                     break;
 
-                case 4: // Clean & Fix rEFInd
-                    cleanAndFixRefind(repairOps);
+                case 6: // Clean & Fix rEFInd
+                    cleanFixRefind(repairOps);
                     break;
 
-                case 5: // Fix Dual-EFI Boot
+                case 7: // Fix Dual-EFI Boot
                     fixDualEfiBoot(repairOps);
                     break;
 
-                case 6: // Show System Info
-                    showSystemInformation();
+                case 8: // Show System Information
+                    showSystemInfo();
                     break;
 
-                case 7: // Diagnose System
-                    diagnoseSystem();
+                case 9: // System Diagnostics
+                    showDiagnosticsMenu(repairOps);
                     break;
 
-                case 8: // Advanced Options
+                case 10: // Advanced Options
                     showAdvancedMenu(repairOps);
                     break;
 
-                case 9: // Exit
+                case 11: // Exit
                     shouldExit = true;
                     break;
                 case -1: // Quit
@@ -315,6 +325,9 @@ class DeborkApp {
 
         string[] steps = [
             "Update all packages with package manager",
+            "Fix graphics drivers configuration",
+            "Validate shell configurations",
+            "Check and configure network connectivity",
             "Regenerate initramfs for all kernels",
             "Fix bootloader configuration",
             "Complete system repair in one operation"
@@ -329,6 +342,9 @@ class DeborkApp {
 
         RepairConfig config;
         config.updatePackages = true;
+        config.fixGraphicsDrivers = true;
+        config.validateShellConfigs = true;
+        config.validateNetworkConfig = true;
         config.regenerateInitramfs = true;
         config.fixBootloader = true;
         config.verboseOutput = verboseMode;
@@ -392,6 +408,41 @@ class DeborkApp {
             ui.printError("Initramfs regeneration failed");
         }
 
+        ui.printInfo("Press any key to continue...");
+        ui.waitForKey();
+    }
+
+    /**
+     * Fix graphics drivers only
+     */
+    private void fixGraphicsDrivers(RepairOperations repairOps) {
+        ui.printHeader();
+        ui.printInfo("Fixing graphics drivers configuration...");
+
+        if (repairOps.fixGraphicsDrivers(sysInfo)) {
+            ui.printStatus("✓ Graphics drivers fixed successfully");
+        } else {
+            ui.printError("Graphics driver fix failed");
+        }
+
+        ui.printInfo("Press any key to continue...");
+        ui.waitForKey();
+    }
+
+    /**
+     * Configure network connectivity
+     */
+    private void configureNetwork(RepairOperations repairOps) {
+        ui.printHeader();
+        ui.printInfo("Configuring network connectivity...");
+
+        if (repairOps.validateNetworkConfiguration(sysInfo)) {
+            ui.printStatus("✓ Network configuration completed");
+        } else {
+            ui.printInfo("Network configuration unchanged or failed");
+        }
+
+        ui.printInfo("Press any key to continue...");
         ui.waitForKey();
     }
 
@@ -504,13 +555,49 @@ class DeborkApp {
     }
 
     /**
-     * Diagnose system issues
+     * Show comprehensive diagnostics menu
      */
-    private void diagnoseSystem() {
-        ui.printHeader();
-        string[] diagnosis = ChrootManager.diagnoseChrootIssues(sysInfo);
-        ui.printList(diagnosis);
-        ui.waitForKey();
+    private void showDiagnosticsMenu(RepairOperations repairOps) {
+        MenuOption[] diagnosisMenu = [
+            MenuOption("System & Chroot Issues", "Basic system validation and chroot diagnostics", true),
+            MenuOption("Graphics & Display Issues", "X11, drivers, fonts, and display manager diagnostics", true),
+            MenuOption("Critical System Issues", "Package database, services, symlinks (diagnostic only)", true),
+            MenuOption("Back to Main Menu", "Return to main menu", true)
+        ];
+
+        while (true) {
+            ui.printHeader();
+            ui.printInfo("System Diagnostics");
+            int choice = ui.showMenu(diagnosisMenu);
+
+            switch (choice) {
+                case 0: // System & Chroot
+                    ui.printHeader();
+                    ui.printInfo("Diagnosing system and chroot environment...");
+                    string[] diagnosis = ChrootManager.diagnoseChrootIssues(sysInfo);
+                    ui.printList(diagnosis);
+                    ui.printInfo("Press any key to continue...");
+                    ui.waitForKey();
+                    break;
+
+                case 1: // Graphics & Display
+                    repairOps.diagnoseGraphicsIssues(sysInfo);
+                    break;
+
+                case 2: // Critical System Issues
+                    repairOps.diagnoseCriticalSystemIssues(sysInfo);
+                    ui.printInfo("Press any key to continue...");
+                    ui.waitForKey();
+                    break;
+
+                case 3: // Back
+                case -1: // Quit
+                    return;
+
+                default:
+                    break;
+            }
+        }
     }
 
     /**
@@ -520,7 +607,11 @@ class DeborkApp {
         MenuOption[] advancedMenu = [
             MenuOption("Repair Filesystem", "Check and repair filesystem errors", true),
             MenuOption("Fix File Permissions", "Repair common permission issues", true),
+            MenuOption("Validate Shell Configurations", "Check bash/zsh/fish configs for errors", true),
+            MenuOption("Configure Network (nmtui)", "Launch NetworkManager Text UI", true),
+            MenuOption("Remove Plymouth from GRUB", "Disable boot splash screen", true),
             MenuOption("Install GRUB Bootloader", "Install GRUB for Btrfs/complex setups", true),
+            MenuOption("Diagnose Graphics Issues", "Detailed graphics and display diagnostics", true),
             MenuOption("Remount with Different Options", "Change mount options", true),
             MenuOption("View Mount Information", "Show detailed mount info", true),
             MenuOption("Test Chroot Environment", "Verify chroot functionality", true),
@@ -542,16 +633,45 @@ class DeborkApp {
                     ui.waitForKey();
                     break;
 
-                case 1: // Fix Permissions
-                    if (repairOps.fixPermissions(sysInfo)) {
-                        ui.printStatus("✓ Permission fixes applied");
+                case 1: // Fix File Permissions
+                    if (repairOps.fixFilePermissions(sysInfo)) {
+                        ui.printStatus("✓ File permissions repaired");
                     } else {
-                        ui.printError("Permission fixes failed");
+                        ui.printError("Permission repair failed");
                     }
                     ui.waitForKey();
                     break;
 
-                case 2: // Install GRUB
+                case 2: // Validate Shell Configurations
+                    if (repairOps.validateShellConfigurations(sysInfo)) {
+                        ui.printStatus("✓ Shell configurations validated and fixed");
+                    } else {
+                        ui.printInfo("Shell configurations appear to be okay");
+                    }
+                    ui.waitForKey();
+                    break;
+
+                case 3: // Configure Network (nmtui)
+                    ui.printHeader();
+                    ui.printInfo("Launching NetworkManager Text UI...");
+                    if (repairOps.launchNetworkManagerTUI(sysInfo)) {
+                        ui.printStatus("✓ Network configuration completed");
+                    } else {
+                        ui.printInfo("Network configuration unchanged");
+                    }
+                    ui.waitForKey();
+                    break;
+
+                case 4: // Remove Plymouth from GRUB
+                    if (repairOps.removePlymouthFromGrub(sysInfo)) {
+                        ui.printStatus("✓ Plymouth removed from GRUB configuration");
+                    } else {
+                        ui.printError("Failed to remove Plymouth from GRUB");
+                    }
+                    ui.waitForKey();
+                    break;
+
+                case 5: // Install GRUB
                     ui.printHeader();
                     ui.printInfo("Installing GRUB bootloader...");
                     if (repairOps.installGrubBootloader(sysInfo)) {
@@ -581,7 +701,7 @@ class DeborkApp {
                     ui.waitForKey();
                     break;
 
-                case 5: // Test Chroot
+                case 9: // Test Chroot
                     if (ChrootManager.testChroot(sysInfo)) {
                         ui.printStatus("✓ Chroot test passed");
                     } else {
@@ -590,7 +710,7 @@ class DeborkApp {
                     ui.waitForKey();
                     break;
 
-                case 6: // Back
+                case 10: // Back
                 case -1:
                     return;
 
