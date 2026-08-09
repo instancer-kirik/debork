@@ -325,7 +325,16 @@ pub const CuteTUI = struct {
                     return;
                 }
 
+                system.detectDistribution(self.allocator, &self.sys_info);
+                system.detectPackageManager(self.allocator, &self.sys_info);
                 bootloaders.detectBootLoader(self.allocator, &self.sys_info);
+
+                // Patch mkinitcpio.conf hooks/modules before regenerating initramfs
+                const mkinit_res = chroot.ensureMkinitcpioConfig(self.allocator, &self.sys_info) catch null;
+                if (mkinit_res) |r| {
+                    defer self.allocator.free(r.message);
+                    if (!r.success) self.setStatus(r.message, 3);
+                }
 
                 const boot_res = switch (self.sys_info.boot_loader) {
                     .grub => try bootloaders.fixGrub(self.allocator, &self.sys_info),
@@ -357,7 +366,7 @@ pub const CuteTUI = struct {
 
                 try self.enableRawMode();
                 _ = stdout.writeAll(ALT_SCREEN ++ HIDE_CURSOR) catch {};
-                self.setStatus("Returned from emergency shell! 🔮", 0);
+                self.setStatus("Returned from emergency shell.", 0);
             },
             2 => { // Regenerate Initramfs
                 if (self.demo_mode) {
@@ -414,15 +423,60 @@ pub const CuteTUI = struct {
             return;
         }
 
-        // Pick first Linux root partition or first partition
-        var chosen_dev: []const u8 = parts[0].device;
-        for (parts) |p| {
-            if (p.is_linux_root) {
-                chosen_dev = p.device;
-                break;
-            }
+        // Leave raw/alt-screen mode so we can print normally
+        self.disableRawMode();
+        const stdout = std.fs.File.stdout();
+        _ = stdout.writeAll(NORM_SCREEN ++ SHOW_CURSOR ++ CLEAR) catch {};
+
+        // Print header
+        _ = stdout.writeAll(COLOR_FUCHSIA ++ BOLD ++ "Select Target Partition:\n" ++ RESET) catch {};
+
+        // List partitions
+        for (parts, 0..) |p, i| {
+            const uuid_short = if (p.uuid.len >= 8) p.uuid[0..8] else p.uuid;
+            var line_buf: [256]u8 = undefined;
+            const label_part = if (p.label.len > 0)
+                std.fmt.bufPrint(&line_buf, "  {d})  {s}  {s}  {s}  {s}...  [{s}]\n", .{ i + 1, p.device, p.fstype, p.size, uuid_short, p.label }) catch ""
+            else
+                std.fmt.bufPrint(&line_buf, "  {d})  {s}  {s}  {s}  {s}...\n", .{ i + 1, p.device, p.fstype, p.size, uuid_short }) catch "";
+            _ = stdout.writeAll(COLOR_TEXT) catch {};
+            _ = stdout.writeAll(label_part) catch {};
         }
 
+        // Prompt
+        _ = stdout.writeAll(COLOR_CYAN) catch {};
+        var prompt_buf: [64]u8 = undefined;
+        const prompt = std.fmt.bufPrint(&prompt_buf, "Enter number (1-{d}) or 0 to cancel: ", .{parts.len}) catch "Enter number or 0 to cancel: ";
+        _ = stdout.writeAll(prompt) catch {};
+        _ = stdout.writeAll(RESET) catch {};
+
+        // Read from /dev/tty (stdin may be broken under sudo)
+        var chosen_idx: ?usize = null;
+        if (std.fs.openFileAbsolute("/dev/tty", .{ .mode = .read_only })) |tty| {
+            defer tty.close();
+            var line_buf2: [32]u8 = undefined;
+            const n = tty.read(&line_buf2) catch 0;
+            if (n > 0) {
+                const trimmed = std.mem.trim(u8, line_buf2[0..n], &std.ascii.whitespace);
+                if (std.fmt.parseInt(usize, trimmed, 10)) |num| {
+                    if (num >= 1 and num <= parts.len) {
+                        chosen_idx = num - 1;
+                    }
+                    // 0 means cancel
+                } else |_| {}
+            }
+        } else |_| {}
+
+        // Restore raw mode and alt screen
+        self.enableRawMode() catch {};
+        _ = stdout.writeAll(ALT_SCREEN ++ HIDE_CURSOR) catch {};
+
+        const idx = chosen_idx orelse {
+            self.setStatus("Cancelled", 3);
+            return;
+        };
+
+        const chosen_dev = parts[idx].device;
         const mounted_ok = try system.mountSystem(self.allocator, &self.sys_info, chosen_dev);
         if (mounted_ok) {
             self.setStatus("System partition mounted successfully!", 1);

@@ -56,7 +56,61 @@ pub fn fixGrub(allocator: std.mem.Allocator, sys: *system.SystemInfo) !FixResult
         return .{ .success = false, .message = try std.fmt.allocPrint(allocator, "grub-mkconfig failed: {s}", .{res1.stderr}) };
     }
 
-    return .{ .success = true, .message = try allocator.dupe(u8, "GRUB configuration updated successfully!") };
+    // Detect boot device by stripping partition suffix from sys.device
+    const dev = sys.device;
+    var boot_dev: []const u8 = dev;
+    // nvme devices end in pN (e.g. /dev/nvme0n1p2 -> /dev/nvme0n1)
+    if (std.mem.indexOf(u8, dev, "nvme") != null) {
+        var i: usize = dev.len;
+        while (i > 0 and std.ascii.isDigit(dev[i - 1])) : (i -= 1) {}
+        if (i > 0 and dev[i - 1] == 'p') i -= 1;
+        boot_dev = dev[0..i];
+    } else {
+        var i: usize = dev.len;
+        while (i > 0 and std.ascii.isDigit(dev[i - 1])) : (i -= 1) {}
+        boot_dev = dev[0..i];
+    }
+
+    // Check if grub-install is available inside the chroot
+    const gi_usr = try std.fmt.allocPrint(allocator, "{s}/usr/bin/grub-install", .{sys.mount_point});
+    defer allocator.free(gi_usr);
+    const gi_sbin = try std.fmt.allocPrint(allocator, "{s}/usr/sbin/grub-install", .{sys.mount_point});
+    defer allocator.free(gi_sbin);
+
+    var install_msg: []const u8 = try allocator.dupe(u8, "");
+    defer allocator.free(install_msg);
+
+    if (fileExists(gi_usr) or fileExists(gi_sbin)) {
+        // Try EFI install first
+        const efi_res = system.executeCmd(allocator, &.{
+            "chroot",                    sys.mount_point,
+            "grub-install",              "--target=x86_64-efi",
+            "--efi-directory=/boot/efi", "--bootloader-id=GRUB",
+            "--recheck",
+        }) catch null;
+        if (efi_res) |r| {
+            defer allocator.free(r.stdout);
+            defer allocator.free(r.stderr);
+            if (r.exit_code == 0) {
+                allocator.free(install_msg);
+                install_msg = try allocator.dupe(u8, " grub-install(EFI): OK.");
+            } else {
+                // EFI failed — fallback to BIOS
+                const bios_res = system.executeCmd(allocator, &.{ "grub-install", boot_dev }) catch null;
+                if (bios_res) |br| {
+                    defer allocator.free(br.stdout);
+                    defer allocator.free(br.stderr);
+                    allocator.free(install_msg);
+                    install_msg = if (br.exit_code == 0)
+                        try allocator.dupe(u8, " grub-install(BIOS): OK.")
+                    else
+                        try std.fmt.allocPrint(allocator, " grub-install(BIOS) failed: {s}", .{br.stderr});
+                }
+            }
+        }
+    }
+
+    return .{ .success = true, .message = try std.fmt.allocPrint(allocator, "GRUB configuration updated successfully!{s}", .{install_msg}) };
 }
 
 pub fn fixRefind(allocator: std.mem.Allocator, sys: *system.SystemInfo, selected_kernel_idx: usize) !FixResult {
@@ -81,10 +135,31 @@ pub fn fixRefind(allocator: std.mem.Allocator, sys: *system.SystemInfo, selected
         try allocator.dupe(u8, "");
     defer allocator.free(initrd_opt);
 
-    const content = try std.fmt.allocPrint(allocator,
-        \\"Boot Linux with {s}" "{s} root=UUID={s} rw{s}"
-        \\
-    , .{ k.version, k.path, sys.uuid, initrd_opt });
+    var content: []const u8 = undefined;
+    if (sys.is_btrfs and sys.root_subvol.len > 0) {
+        const subvol = sys.root_subvol;
+        const main_line = try std.fmt.allocPrint(allocator,
+            \\"{s}" "{s} root=UUID={s} rw rootflags=subvol={s}{s}"
+            \\
+        , .{ k.version, k.path, sys.uuid, subvol, initrd_opt });
+        defer allocator.free(main_line);
+        // Add fallback with subvol=@ if it differs from the detected subvol
+        if (!std.mem.eql(u8, subvol, "@")) {
+            const fallback_line = try std.fmt.allocPrint(allocator,
+                \\"Boot Linux with {s} (fallback subvol)" "{s} root=UUID={s} rw rootflags=subvol=@{s}"
+                \\
+            , .{ k.version, k.path, sys.uuid, initrd_opt });
+            defer allocator.free(fallback_line);
+            content = try std.mem.concat(allocator, u8, &.{ main_line, fallback_line });
+        } else {
+            content = try allocator.dupe(u8, main_line);
+        }
+    } else {
+        content = try std.fmt.allocPrint(allocator,
+            \\"{s}" "{s} root=UUID={s} rw{s}"
+            \\
+        , .{ k.version, k.path, sys.uuid, initrd_opt });
+    }
     defer allocator.free(content);
 
     const file = std.fs.cwd().createFile(conf_path, .{}) catch |err| {

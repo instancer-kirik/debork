@@ -60,6 +60,8 @@ pub const SystemInfo = struct {
     is_btrfs: bool = false,
     root_subvol: []const u8 = "",
     mounted: bool = false,
+    distribution: []const u8 = "",
+    pkg_manager: []const u8 = "",
 
     pub fn deinit(self: *SystemInfo, allocator: std.mem.Allocator) void {
         if (self.device.len > 0) allocator.free(self.device);
@@ -69,6 +71,8 @@ pub const SystemInfo = struct {
         if (self.efi_dir.len > 0) allocator.free(self.efi_dir);
         if (self.fstype.len > 0) allocator.free(self.fstype);
         if (self.root_subvol.len > 0) allocator.free(self.root_subvol);
+        if (self.distribution.len > 0) allocator.free(self.distribution);
+        if (self.pkg_manager.len > 0) allocator.free(self.pkg_manager);
 
         for (self.kernels.items) |*k| {
             k.deinit(allocator);
@@ -195,7 +199,10 @@ fn scanPartitionsBlkId(allocator: std.mem.Allocator) ![]PartitionInfo {
                     .is_linux_root = is_root,
                 });
             }
-            cur_dev = ""; cur_uuid = ""; cur_label = ""; cur_type = "";
+            cur_dev = "";
+            cur_uuid = "";
+            cur_label = "";
+            cur_type = "";
             continue;
         }
 
@@ -205,6 +212,182 @@ fn scanPartitionsBlkId(allocator: std.mem.Allocator) ![]PartitionInfo {
         if (std.mem.startsWith(u8, line, "TYPE=")) cur_type = line["TYPE=".len..];
     }
     return list.toOwnedSlice(allocator);
+}
+
+// Parsed representation of a single btrfs subvolume list entry.
+const BtrfsSubvol = struct {
+    top_level: u32,
+    // Slice into the btrfs-list stdout buffer — valid for its lifetime.
+    path: []const u8,
+};
+
+/// Parse one line of `btrfs subvolume list` output.
+/// Expected format: "ID N gen N top level N path PATH"
+/// Returns null if the line doesn't match.
+fn parseBtrfsSubvolLine(line: []const u8) ?BtrfsSubvol {
+    // Find " path " marker — everything after it is the subvolume path.
+    const path_marker = " path ";
+    const path_pos = std.mem.indexOf(u8, line, path_marker) orelse return null;
+    const path = std.mem.trim(u8, line[path_pos + path_marker.len ..], " \t\r\n");
+    if (path.len == 0) return null;
+
+    // Extract "top level N" — the marker precedes " path ".
+    const tl_marker = "top level ";
+    const tl_pos = std.mem.indexOf(u8, line[0..path_pos], tl_marker) orelse return null;
+    const tl_start = tl_pos + tl_marker.len;
+    // The top-level number runs until the next space.
+    const tl_end = std.mem.indexOfScalarPos(u8, line, tl_start, ' ') orelse path_pos;
+    const top_level = std.fmt.parseUnsigned(u32, line[tl_start..tl_end], 10) catch return null;
+
+    return .{ .top_level = top_level, .path = path };
+}
+
+/// Detect the root btrfs subvolume using a three-pass strategy.
+/// Returns a duped string (caller owns) or null when nothing matched.
+fn detectBtrfsRootSubvol(allocator: std.mem.Allocator, device: []const u8) !?[]const u8 {
+    const temp_mount = "/tmp/debork_btrfs_detect";
+
+    std.fs.cwd().makePath(temp_mount) catch {};
+
+    // Temp-mount read-only so we can query subvolume list.
+    const mnt_res = try executeCmd(allocator, &.{ "mount", "-o", "ro", device, temp_mount });
+    defer allocator.free(mnt_res.stdout);
+    defer allocator.free(mnt_res.stderr);
+
+    if (mnt_res.exit_code != 0) {
+        std.log.warn("btrfs temp-mount failed: {s}", .{mnt_res.stderr});
+        return null;
+    }
+
+    // Always unmount the temp mount before returning.
+    defer {
+        const u = executeCmd(allocator, &.{ "umount", temp_mount }) catch null;
+        if (u) |r| {
+            allocator.free(r.stdout);
+            allocator.free(r.stderr);
+        }
+    }
+
+    const list_res = try executeCmd(allocator, &.{ "btrfs", "subvolume", "list", temp_mount });
+    defer allocator.free(list_res.stdout);
+    defer allocator.free(list_res.stderr);
+
+    if (list_res.exit_code != 0 or list_res.stdout.len == 0) {
+        return null;
+    }
+
+    // Collect all parsed subvolumes into a temporary list.
+    var subvols: std.ArrayListUnmanaged(BtrfsSubvol) = .empty;
+    defer subvols.deinit(allocator);
+
+    var lines = std.mem.splitSequence(u8, list_res.stdout, "\n");
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (parseBtrfsSubvolLine(trimmed)) |sv| {
+            try subvols.append(allocator, sv);
+        }
+    }
+
+    if (subvols.items.len == 0) return null;
+
+    // --- Pass 1: exact name match ---
+    const exact_patterns = [_][]const u8{ "@", "root", "rootfs", "@rootfs", "/" };
+    for (exact_patterns) |pat| {
+        for (subvols.items) |sv| {
+            if (std.mem.eql(u8, sv.path, pat)) {
+                return try allocator.dupe(u8, sv.path);
+            }
+        }
+    }
+
+    // --- Pass 2: path contains "root" but not "home", "var", "tmp", "cache", "log" ---
+    for (subvols.items) |sv| {
+        if (std.mem.indexOf(u8, sv.path, "root") != null and
+            std.mem.indexOf(u8, sv.path, "home") == null and
+            std.mem.indexOf(u8, sv.path, "var") == null and
+            std.mem.indexOf(u8, sv.path, "tmp") == null and
+            std.mem.indexOf(u8, sv.path, "cache") == null and
+            std.mem.indexOf(u8, sv.path, "log") == null)
+        {
+            return try allocator.dupe(u8, sv.path);
+        }
+    }
+
+    // --- Pass 3: top-level id == 5 ---
+    for (subvols.items) |sv| {
+        if (sv.top_level == 5 and sv.path.len > 0) {
+            return try allocator.dupe(u8, sv.path);
+        }
+    }
+
+    return null;
+}
+
+/// Try mounting with a specific btrfs subvolume option.
+/// Returns true on success, false (and leaves mount_point clean) on failure.
+fn tryBtfrsMount(allocator: std.mem.Allocator, device: []const u8, mount_point: []const u8, subvol: []const u8) !bool {
+    const opt = try std.fmt.allocPrint(allocator, "subvol={s}", .{subvol});
+    defer allocator.free(opt);
+    const res = try executeCmd(allocator, &.{ "mount", "-o", opt, device, mount_point });
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+    return res.exit_code == 0;
+}
+
+/// After a successful root mount, mount well-known additional btrfs subvolumes
+/// when their target directories already exist inside the chroot.
+fn mountAdditionalBtrfsSubvols(allocator: std.mem.Allocator, device: []const u8, mount_point: []const u8) void {
+    const extra = [_][]const u8{ "@home", "@root", "@srv", "@cache", "@tmp", "@log", "@var" };
+    for (extra) |subvol| {
+        // Strip leading '@' to get the directory name.
+        const dir_name = subvol[1..];
+        const target = std.fmt.allocPrint(allocator, "{s}/{s}", .{ mount_point, dir_name }) catch continue;
+        defer allocator.free(target);
+
+        // Only mount if the directory exists inside the chroot.
+        std.fs.cwd().access(target, .{}) catch continue;
+
+        const opt = std.fmt.allocPrint(allocator, "subvol={s}", .{subvol}) catch continue;
+        defer allocator.free(opt);
+
+        const res = executeCmd(allocator, &.{ "mount", "-o", opt, device, target }) catch continue;
+        allocator.free(res.stdout);
+        allocator.free(res.stderr);
+    }
+}
+
+/// Detect and mount the EFI system partition into the chroot.
+/// Updates sys.efi_dir when a suitable directory is found.
+fn mountEfiPartition(allocator: std.mem.Allocator, sys: *SystemInfo) void {
+    const candidates = [_][]const u8{ "boot/efi", "efi", "boot/EFI" };
+
+    for (candidates) |rel| {
+        const efi_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ sys.mount_point, rel }) catch continue;
+        defer allocator.free(efi_path);
+
+        std.fs.cwd().access(efi_path, .{}) catch continue;
+
+        // Found a directory — update efi_dir.
+        if (sys.efi_dir.len > 0) allocator.free(sys.efi_dir);
+        sys.efi_dir = allocator.dupe(u8, efi_path) catch continue;
+
+        // Try to find the EFI device via findmnt.
+        const fm_res = executeCmd(allocator, &.{ "findmnt", "-n", "-o", "SOURCE", "-t", "vfat", "/boot/efi" }) catch continue;
+        defer allocator.free(fm_res.stdout);
+        defer allocator.free(fm_res.stderr);
+
+        if (fm_res.exit_code == 0) {
+            const efi_dev = std.mem.trim(u8, fm_res.stdout, " \t\r\n");
+            if (efi_dev.len > 0) {
+                const mnt_res = executeCmd(allocator, &.{ "mount", efi_dev, efi_path }) catch continue;
+                allocator.free(mnt_res.stdout);
+                allocator.free(mnt_res.stderr);
+                // Whether or not mount succeeded the directory is set; stop searching.
+            }
+        }
+        return;
+    }
 }
 
 pub fn mountSystem(allocator: std.mem.Allocator, sys: *SystemInfo, device: []const u8) !bool {
@@ -225,33 +408,48 @@ pub fn mountSystem(allocator: std.mem.Allocator, sys: *SystemInfo, device: []con
         }
     }
 
-    var mount_args: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer mount_args.deinit(allocator);
-
-    try mount_args.append(allocator, "mount");
-
+    // --- btrfs: subvolume detection and mount ---
     if (sys.is_btrfs) {
-        const subvol_res = executeCmd(allocator, &.{ "btrfs", "subvolume", "list", device }) catch null;
-        if (subvol_res) |res| {
-            defer allocator.free(res.stdout);
-            defer allocator.free(res.stderr);
-            if (std.mem.indexOf(u8, res.stdout, "@") != null) {
-                try mount_args.append(allocator, "-o");
-                try mount_args.append(allocator, "subvol=@");
-                sys.root_subvol = try allocator.dupe(u8, "@");
+        const detected = detectBtrfsRootSubvol(allocator, device) catch null;
+
+        var mounted_with_subvol = false;
+
+        if (detected) |subvol| {
+            // Attempt mount with detected subvolume.
+            const ok = tryBtfrsMount(allocator, device, sys.mount_point, subvol) catch false;
+            if (ok) {
+                sys.root_subvol = subvol; // transfer ownership
+                mounted_with_subvol = true;
+            } else {
+                allocator.free(subvol);
             }
         }
-    }
 
-    try mount_args.append(allocator, device);
-    try mount_args.append(allocator, sys.mount_point);
+        if (!mounted_with_subvol) {
+            // Fallback: try "@" explicitly.
+            const ok = tryBtfrsMount(allocator, device, sys.mount_point, "@") catch false;
+            if (ok) {
+                sys.root_subvol = try allocator.dupe(u8, "@");
+                mounted_with_subvol = true;
+            }
+        }
 
-    const mount_res = try executeCmd(allocator, mount_args.items);
-    defer allocator.free(mount_res.stdout);
-    defer allocator.free(mount_res.stderr);
+        if (!mounted_with_subvol) {
+            // Last resort: plain mount without any subvol option.
+            const res = try executeCmd(allocator, &.{ "mount", device, sys.mount_point });
+            defer allocator.free(res.stdout);
+            defer allocator.free(res.stderr);
+            if (res.exit_code != 0) return false;
+        }
 
-    if (mount_res.exit_code != 0) {
-        return false;
+        // Mount additional well-known subvolumes if their dirs exist.
+        mountAdditionalBtrfsSubvols(allocator, device, sys.mount_point);
+    } else {
+        // Non-btrfs: plain mount.
+        const res = try executeCmd(allocator, &.{ "mount", device, sys.mount_point });
+        defer allocator.free(res.stdout);
+        defer allocator.free(res.stderr);
+        if (res.exit_code != 0) return false;
     }
 
     sys.device = try allocator.dupe(u8, device);
@@ -282,10 +480,16 @@ pub fn mountSystem(allocator: std.mem.Allocator, sys: *SystemInfo, device: []con
         allocator.free(bind_res.stderr);
     }
 
-    // Copy network resolv.conf for chroot package updates
-    const resolv_dest = try std.fmt.allocPrint(allocator, "{s}/etc/resolv.conf", .{sys.mount_point});
-    defer allocator.free(resolv_dest);
-    std.fs.cwd().copyFile("/etc/resolv.conf", std.fs.cwd(), resolv_dest, .{}) catch {};
+    // Detect and mount EFI partition
+    mountEfiPartition(allocator, sys);
+
+    // Copy network files for chroot package updates
+    const network_files = [_][]const u8{ "/etc/resolv.conf", "/etc/hosts" };
+    for (network_files) |src| {
+        const dest = std.fmt.allocPrint(allocator, "{s}{s}", .{ sys.mount_point, src }) catch continue;
+        defer allocator.free(dest);
+        std.fs.cwd().copyFile(src, std.fs.cwd(), dest, .{}) catch {};
+    }
 
     return true;
 }
@@ -307,4 +511,106 @@ pub fn unmountSystem(allocator: std.mem.Allocator, sys: *SystemInfo) void {
     allocator.free(root_res.stderr);
 
     sys.mounted = false;
+}
+
+/// Detect the Linux distribution of the mounted system and store the result in
+/// sys.distribution. Caller must ensure sys is mounted before calling.
+pub fn detectDistribution(allocator: std.mem.Allocator, sys: *SystemInfo) void {
+    if (!sys.mounted) return;
+
+    // --- Primary: parse /etc/os-release ---
+    const os_release_path = std.fmt.allocPrint(allocator, "{s}/etc/os-release", .{sys.mount_point}) catch return;
+    defer allocator.free(os_release_path);
+
+    read_os_release: {
+        const file = std.fs.cwd().openFile(os_release_path, .{}) catch break :read_os_release;
+        defer file.close();
+
+        const content = file.readToEndAlloc(allocator, 256 * 1024) catch break :read_os_release;
+        defer allocator.free(content);
+
+        var it = std.mem.splitSequence(u8, content, "\n");
+        while (it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (!std.mem.startsWith(u8, trimmed, "PRETTY_NAME=")) continue;
+
+            var value = trimmed["PRETTY_NAME=".len..];
+            // Strip surrounding quotes if present.
+            if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+                value = value[1 .. value.len - 1];
+            } else if (value.len >= 1 and value[0] == '"') {
+                value = value[1..];
+            }
+            if (value.len > 0) {
+                if (sys.distribution.len > 0) allocator.free(sys.distribution);
+                sys.distribution = allocator.dupe(u8, value) catch return;
+                return;
+            }
+        }
+    }
+
+    // --- Fallback checks ---
+    const FallbackEntry = struct { rel_path: []const u8, name: ?[]const u8 };
+    const fallbacks = [_]FallbackEntry{
+        .{ .rel_path = "etc/arch-release", .name = "Arch Linux" },
+        .{ .rel_path = "etc/debian_version", .name = "Debian/Ubuntu" },
+        .{ .rel_path = "etc/redhat-release", .name = null }, // read content
+        .{ .rel_path = "etc/SuSE-release", .name = "openSUSE" },
+    };
+
+    for (fallbacks) |fb| {
+        const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ sys.mount_point, fb.rel_path }) catch continue;
+        defer allocator.free(full_path);
+
+        std.fs.cwd().access(full_path, .{}) catch continue;
+
+        if (fb.name) |static_name| {
+            if (sys.distribution.len > 0) allocator.free(sys.distribution);
+            sys.distribution = allocator.dupe(u8, static_name) catch return;
+            return;
+        }
+
+        // Read first line of the release file as the distribution name.
+        read_content: {
+            const file = std.fs.cwd().openFile(full_path, .{}) catch break :read_content;
+            defer file.close();
+            const content = file.readToEndAlloc(allocator, 4096) catch break :read_content;
+            defer allocator.free(content);
+            const first_line = std.mem.trim(u8, blk: {
+                const nl = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
+                break :blk content[0..nl];
+            }, " \t\r\n");
+            if (first_line.len > 0) {
+                if (sys.distribution.len > 0) allocator.free(sys.distribution);
+                sys.distribution = allocator.dupe(u8, first_line) catch return;
+                return;
+            }
+        }
+    }
+}
+
+/// Detect the package manager available in the mounted system and store the
+/// result in sys.pkg_manager. Caller must ensure sys is mounted before calling.
+pub fn detectPackageManager(allocator: std.mem.Allocator, sys: *SystemInfo) void {
+    if (!sys.mounted) return;
+
+    const PmEntry = struct { bin: []const u8, name: []const u8 };
+    const candidates = [_]PmEntry{
+        .{ .bin = "usr/bin/pacman", .name = "pacman" },
+        .{ .bin = "usr/bin/apt", .name = "apt" },
+        .{ .bin = "usr/bin/dnf", .name = "dnf" },
+        .{ .bin = "usr/bin/yum", .name = "yum" },
+        .{ .bin = "usr/bin/zypper", .name = "zypper" },
+    };
+
+    for (candidates) |c| {
+        const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ sys.mount_point, c.bin }) catch continue;
+        defer allocator.free(full_path);
+
+        std.fs.cwd().access(full_path, .{}) catch continue;
+
+        if (sys.pkg_manager.len > 0) allocator.free(sys.pkg_manager);
+        sys.pkg_manager = allocator.dupe(u8, c.name) catch return;
+        return;
+    }
 }
