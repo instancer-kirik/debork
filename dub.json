@@ -1,0 +1,30 @@
+{
+    "name": "debork",
+    "description": "Cross-platform Linux boot rescue tool with TUI interface",
+    "authors": ["Debork Team"],
+    "copyright": "Copyright © 2024, Debork Team",
+    "license": "MIT",
+    "homepage": "https://github.com/debork/debork",
+    "targetType": "executable",
+    "targetName": "debork",
+    "sourcePaths": ["."],
+    "sourceFiles": ["fixer.d"],
+    "mainSourceFile": "fixer.d",
+    
+    "configurations": [
+        {
+            "name": "release",
+            "buildOptions": ["optimize", "inline", "releaseMode"]
+        },
+        {
+            "name": "debug",
+            "buildOptions": ["debugMode", "debugInfo"]
+        },
+        {
+            "name": "rescue",
+            "buildOptions": ["optimize", "inline", "releaseMode"],
+            "targetName": "debork-static",
+            "dflags": ["-static"]
+        }
+    ]
+}
